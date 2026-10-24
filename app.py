@@ -46,9 +46,9 @@ except ValueError:
     logger.error("OWNER_ID or ADMIN_ID must be valid integers!")
     raise
 
-YOUR_USERNAME = '@Hackerwibes9'
-UPDATE_CHANNEL = 'https://t.me/geniushackertools'
-YOUTUBE_CHANNEL = 'https://youtube.com/@geniushacker29'
+YOUR_USERNAME = '@Troy619'
+UPDATE_CHANNEL = 'https://t.me/Toyi619'
+YOUTUBE_CHANNEL = 'https://youtube.com/@toyiunofficial9194'
 CHANNEL_USERNAME = '@' + UPDATE_CHANNEL.rstrip('/').split('/')[-1]
 
 BASE_DIR = Path(__file__).parent.absolute()
@@ -303,14 +303,14 @@ def get_admin_panel_keyboard():
 
 def build_welcome_text(user_id: int, full_name: str) -> str:
     return f"""╔═══════════════════════╗
-    🚀 <b>GENIUS HOSTBOT</b> 🚀
+    🚀 <b>ESMIRINGHOY HOSTBOT</b> 🚀
     ⚡ <i>Script Runner Bot</i>
 ╚═══════════════════════╝
 
 👋 <b>Welcome, {full_name}!</b>
 
 🆔 <b>Your ID:</b> <code>{user_id}</code>
-📦 <b>Upload Limit:</b> Unlimited ♾️
+📦 <b>Upload Limit:</b> Unlimited UGH😋
 
 ━━━━━━━━━━━━━━━━━━━━
 <b>🔥 AVAILABLE FEATURES</b>
@@ -329,7 +329,7 @@ def build_welcome_text(user_id: int, full_name: str) -> str:
 📢 <b>Updates:</b> {UPDATE_CHANNEL}
 🎥 <b>YouTube:</b> {YOUTUBE_CHANNEL}
 
-⚡ <b>Developed by</b> Aditya (Genius Hacker)
+😋 <b>Developed by</b> Emiringhoy (Troy Gwapo)
 🔒 <b>Version:</b> 2.0"""
 
 @dp.message(Command("start"))
