@@ -1,3 +1,4 @@
+
 const http = require("http");
 
 const PORT = process.env.PORT || 3000;
@@ -9,7 +10,7 @@ const API_KEYS = [
   process.env.API_KEY_3
 ].filter(Boolean);
 
-const APP_KEY = process.env.TROY_APP_KEY;
+const GATEWAY_APP_KEY = process.env.GATEWAY_APP_KEY;
 
 const RETRY_WAIT = 60000;
 const UPSTREAM_TIMEOUT = 120000;
@@ -43,7 +44,6 @@ function waitForRetry(res, isGone) {
     };
 
     const onClose = () => finish(false);
-
     const timer = setTimeout(() => finish(true), RETRY_WAIT);
 
     res.once("close", onClose);
@@ -68,20 +68,29 @@ async function readRequest(req) {
 }
 
 async function readUpstream(response) {
-  if (!response.body) throw new RetryableError("Empty upstream body");
+  if (!response.body) {
+    throw new RetryableError("Empty upstream body");
+  }
+
   const reader = response.body.getReader();
   const chunks = [];
   let size = 0;
+
   try {
     while (true) {
       const result = await reader.read();
+
       if (result.done) break;
+
       size += result.value.length;
+
       if (size > MAX_RESPONSE_SIZE) {
         throw new RetryableError("Response too large");
       }
+
       chunks.push(Buffer.from(result.value));
     }
+
     return Buffer.concat(chunks);
   } catch (error) {
     await reader.cancel().catch(() => {});
@@ -93,51 +102,76 @@ async function readUpstream(response) {
 
 function validateResponse(buffer, contentType) {
   const text = buffer.toString("utf8").trim();
-  if (!text) throw new RetryableError("Empty response");
+
+  if (!text) {
+    throw new RetryableError("Empty response");
+  }
 
   const isSSE =
     /text\/event-stream/i.test(contentType || "") ||
-    /(^|\\n)(data:|event:)/m.test(text);
+    /(^|\n)(data:|event:)/m.test(text);
 
   if (isSSE) {
     let done = false;
-    for (const event of text.split(/\\r?\\n\\r?\\n/)) {
+
+    for (const event of text.split(/\r?\n\r?\n/)) {
       let eventName = "";
       const data = [];
-      for (const line of event.split(/\\r?\\n/)) {
-        if (line.startsWith("event:")) eventName = line.slice(6).trim();
-        if (line.startsWith("data:")) data.push(line.slice(5).trimStart());
+
+      for (const line of event.split(/\r?\n/)) {
+        if (line.startsWith("event:")) {
+          eventName = line.slice(6).trim();
+        }
+
+        if (line.startsWith("data:")) {
+          data.push(line.slice(5).trimStart());
+        }
       }
-      const payload = data.join("\\n");
+
+      const payload = data.join("\n");
+
       if (eventName === "error") {
         throw new RetryableError("SSE error event");
       }
+
       if (!payload) continue;
+
       if (payload === "[DONE]") {
         done = true;
         continue;
       }
+
       let parsed;
+
       try {
         parsed = JSON.parse(payload);
       } catch {
         throw new RetryableError("Invalid SSE JSON");
       }
+
       if (parsed?.error || parsed?.type === "error") {
         throw new RetryableError("Upstream SSE error");
       }
     }
-    if (!done) throw new RetryableError("Incomplete SSE stream");
+
+    if (!done) {
+      throw new RetryableError("Incomplete SSE stream");
+    }
+
     return;
   }
 
   let parsed;
+
   try {
     parsed = JSON.parse(text);
   } catch {
     throw new RetryableError("Invalid JSON response");
   }
-  if (parsed?.error) throw new RetryableError("Upstream JSON error");
+
+  if (parsed?.error) {
+    throw new RetryableError("Upstream JSON error");
+  }
 }
 
 const server = http.createServer(async (req, res) => {
@@ -172,11 +206,11 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (
-    !APP_KEY ||
-    req.headers.authorization !== `Bearer ${APP_KEY}`
+    !GATEWAY_APP_KEY ||
+    req.headers.authorization !== `Bearer ${GATEWAY_APP_KEY}`
   ) {
     return json(res, 401, {
-      error: "Invalid App Key"
+      error: "Invalid Gateway Key"
     });
   }
 
@@ -229,8 +263,8 @@ const server = http.createServer(async (req, res) => {
       if (clientGone) return;
 
       const key = API_KEYS[i];
-
       const controller = new AbortController();
+
       activeController = controller;
 
       let timeout;
@@ -292,7 +326,7 @@ const server = http.createServer(async (req, res) => {
         if (clientGone) return;
 
         const reason = controller.signal.aborted
-          ? "timeout or cancellation"
+          ? "timeout"
           : error.message;
 
         console.warn(
@@ -305,7 +339,7 @@ const server = http.createServer(async (req, res) => {
 
     if (cycleFailed && !clientGone) {
       console.warn(
-        "All API keys failed. Waiting 60 seconds before restarting at Key 1."
+        "All API keys failed. Retrying from Key 1 in 60 seconds."
       );
 
       const shouldRetry = await waitForRetry(
@@ -319,7 +353,5 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => {
-  console.log(
-    `TroySeek Gateway running on port ${PORT}`
-  );
+  console.log(`Universal API Gateway running on port ${PORT}`);
 });
