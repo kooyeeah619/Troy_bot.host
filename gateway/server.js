@@ -10,20 +10,15 @@ const API_KEYS = [
   { slot: 3, key: process.env.API_KEY_3 }
 ].filter(item => item.key && item.key.trim());
 
-const UPSTREAM_TIMEOUT = 120000; // 120 seconds idle timeout
+// 3 minutes timeout for initial connection, but resets on every chunk
+const UPSTREAM_TIMEOUT = 180000; 
 const MAX_REQUEST_SIZE = 2 * 1024 * 1024;
-const BUFFER_LIMIT = 5; // Bilang ng chunks bago i-commit sa client
 
 let activeKeyIndex = 0;
 
 function sendJson(res, status, data) {
   if (res.headersSent || res.destroyed) return;
-
-  res.writeHead(status, {
-    "Content-Type": "application/json",
-    "Cache-Control": "no-cache"
-  });
-
+  res.writeHead(status, { "Content-Type": "application/json", "Cache-Control": "no-cache" });
   res.end(JSON.stringify(data));
 }
 
@@ -33,7 +28,6 @@ function isBusyResponse(value) {
 
 function advanceKey(index) {
   if (!API_KEYS.length) return;
-
   if (activeKeyIndex === index) {
     activeKeyIndex = (index + 1) % API_KEYS.length;
   }
@@ -43,19 +37,15 @@ function readRequest(req) {
   return new Promise((resolve, reject) => {
     let chunks = [];
     let size = 0;
-
     req.on("data", chunk => {
       size += chunk.length;
-
       if (size > MAX_REQUEST_SIZE) {
         reject(new Error("Request too large"));
         req.destroy();
         return;
       }
-
       chunks.push(chunk);
     });
-
     req.on("end", () => resolve(Buffer.concat(chunks)));
     req.on("error", reject);
   });
@@ -63,9 +53,7 @@ function readRequest(req) {
 
 async function sendUpstream(req, res, body) {
   if (!API_KEYS.length) {
-    return sendJson(res, 500, {
-      error: { message: "No upstream API keys configured" }
-    });
+    return sendJson(res, 500, { error: { message: "No upstream API keys configured" } });
   }
 
   let lastError = null;
@@ -80,6 +68,7 @@ async function sendUpstream(req, res, body) {
     let timeout = null;
     let clientCommitted = false;
 
+    // Reset timeout tuwing may bagong data na dumarating
     const resetTimeout = () => {
         if (timeout) clearTimeout(timeout);
         timeout = setTimeout(() => {
@@ -109,59 +98,50 @@ async function sendUpstream(req, res, body) {
         throw new Error(`HTTP ${upstream.status}: ${errorText.slice(0, 1000)}`);
       }
 
-      if (!upstream.body) {
-        throw new Error("Empty upstream response");
-      }
+      if (!upstream.body) throw new Error("Empty upstream response");
 
       const contentType = upstream.headers.get("content-type") || "application/json";
       const reader = upstream.body.getReader();
-      let bufferedChunks = [];
+      
+      // Kunin ang unang chunk nang direkta (walang buffering)
+      const firstChunk = await reader.read();
+      if (firstChunk.done) throw new Error("Stream ended immediately");
+      
+      const firstChunkStr = Buffer.from(firstChunk.value).toString("utf8");
+      if (isBusyResponse(firstChunkStr)) {
+        throw new Error("Upstream busy during initial stream");
+      }
 
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        
-        resetTimeout();
+      // Kung umabot dito, valid na ang stream. I-commit na sa client.
+      activeKeyIndex = index;
+      clientCommitted = true;
+      
+      console.log(`API key slot ${item.slot} succeeded. Streaming to client.`);
 
-        const chunk = Buffer.from(value);
-        
-        if (isBusyResponse(chunk.toString("utf8"))) {
-            throw new Error("Upstream busy during streaming");
-        }
+      res.writeHead(upstream.status, {
+          "Content-Type": contentType,
+          "Cache-Control": "no-cache, no-transform",
+          "X-Accel-Buffering": "no",
+          "Connection": "keep-alive"
+      });
 
-        bufferedChunks.push(chunk);
+      // Ipadala agad ang unang chunk
+      res.write(Buffer.from(firstChunk.value));
 
-        if (!clientCommitted && bufferedChunks.length >= BUFFER_LIMIT) {
-            activeKeyIndex = index;
-            console.log(`API key slot ${item.slot} succeeded and committed to client.`);
+      try {
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
             
-            res.writeHead(upstream.status, {
-                "Content-Type": contentType,
-                "Cache-Control": "no-cache, no-transform",
-                "X-Accel-Buffering": "no",
-                "Connection": "keep-alive"
-            });
+            resetTimeout(); // I-reset ang timer sa bawat chunk
+
+            const chunk = Buffer.from(value);
             
-            for (const c of bufferedChunks) {
-                if (!res.write(c)) {
-                    await new Promise((resolve, reject) => {
-                        const cleanup = () => {
-                            res.removeListener("drain", onDrain);
-                            res.removeListener("close", onClose);
-                            res.removeListener("error", onError);
-                        };
-                        const onDrain = () => { cleanup(); resolve(); };
-                        const onClose = () => { cleanup(); reject(new Error("Client disconnected")); };
-                        const onError = error => { cleanup(); reject(error); };
-                        res.once("drain", onDrain);
-                        res.once("close", onClose);
-                        res.once("error", onError);
-                    });
-                }
+            if (isBusyResponse(chunk.toString("utf8"))) {
+                throw new Error("Upstream busy during streaming");
             }
-            bufferedChunks = [];
-            clientCommitted = true;
-        } else if (clientCommitted) {
+
+            // Direkta nang isusulat sa client, walang ipon
             if (!res.write(chunk)) {
                 await new Promise((resolve, reject) => {
                     const cleanup = () => {
@@ -178,36 +158,27 @@ async function sendUpstream(req, res, body) {
                 });
             }
         }
-      }
 
-      if (!clientCommitted) {
-          activeKeyIndex = index;
-          res.writeHead(upstream.status, { 
-              "Content-Type": contentType, 
-              "Cache-Control": "no-cache, no-transform",
-              "X-Accel-Buffering": "no",
-              "Connection": "keep-alive"
-          });
-          for (const c of bufferedChunks) res.write(c);
-      }
+        if (!res.destroyed && !res.writableEnded) res.end();
+        console.log(`API key slot ${item.slot} stream completed.`);
+        return;
 
-      if (!res.destroyed && !res.writableEnded) {
-        res.end();
+      } catch (streamError) {
+        console.error(`API key slot ${item.slot} failed mid-stream: ${streamError.message}`);
+        if (!res.destroyed && !res.writableEnded) res.destroy(streamError);
+        return;
       }
-
-      console.log(`API key slot ${item.slot} stream completed.`);
-      return;
 
     } catch (error) {
       lastError = error;
       
       if (clientCommitted) {
-          console.error(`API key slot ${item.slot} failed mid-stream (Cannot fallback): ${error.message}`);
           if (!res.destroyed && !res.writableEnded) res.destroy(error);
           return;
       } else {
           console.error(`API key slot ${item.slot} failed before commit: ${error.message}`);
           advanceKey(index);
+          // Mag-fallback agad sa susunod na key
       }
     } finally {
       if (timeout) clearTimeout(timeout);
@@ -215,10 +186,7 @@ async function sendUpstream(req, res, body) {
   }
 
   sendJson(res, 502, {
-    error: {
-      message: "All upstream API keys failed",
-      details: lastError ? lastError.message : "Unknown error"
-    }
+    error: { message: "All upstream API keys failed", details: lastError ? lastError.message : "Unknown error" }
   });
 }
 
@@ -241,35 +209,26 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (req.method !== "POST" || req.url !== "/v1/chat/completions") {
-    return sendJson(res, 404, {
-      error: { message: "Not found" }
-    });
+    return sendJson(res, 404, { error: { message: "Not found" } });
   }
 
   if (!GATEWAY_APP_KEY) {
-    return sendJson(res, 500, {
-      error: { message: "Gateway app key not configured" }
-    });
+    return sendJson(res, 500, { error: { message: "Gateway app key not configured" } });
   }
 
   const auth = req.headers.authorization || "";
   const suppliedKey = auth.replace(/^Bearer\s+/i, "");
 
   if (suppliedKey !== GATEWAY_APP_KEY) {
-    return sendJson(res, 401, {
-      error: { message: "Unauthorized" }
-    });
+    return sendJson(res, 401, { error: { message: "Unauthorized" } });
   }
 
   let body;
-
   try {
     body = await readRequest(req);
     JSON.parse(body.toString("utf8"));
   } catch (error) {
-    return sendJson(res, 400, {
-      error: { message: error.message || "Invalid JSON" }
-    });
+    return sendJson(res, 400, { error: { message: error.message || "Invalid JSON" } });
   }
 
   await sendUpstream(req, res, body);
@@ -278,9 +237,5 @@ const server = http.createServer(async (req, res) => {
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`Troy Gateway running on port ${PORT}`);
   console.log(`Configured API keys: ${API_KEYS.length}`);
-  console.log(
-    `Initial active key: ${
-      API_KEYS.length ? API_KEYS[activeKeyIndex].slot : "NONE"
-    }`
-  );
+  console.log(`Initial active key: ${API_KEYS.length ? API_KEYS[activeKeyIndex].slot : "NONE"}`);
 });
