@@ -1,158 +1,185 @@
+
 const http = require("http");
+const { once } = require("events");
 
 const PORT = process.env.PORT || 3000;
 const UPSTREAM = "https://100milionseek.top/v1/chat/completions";
 
-const API_KEYS = [
-  process.env.API_KEY_1,
-  process.env.API_KEY_2,
-  process.env.API_KEY_3
-].filter(Boolean);
-
 const GATEWAY_APP_KEY = process.env.GATEWAY_APP_KEY;
+
+const API_KEYS = [
+  { slot: 1, key: process.env.API_KEY_1 },
+  { slot: 2, key: process.env.API_KEY_2 },
+  { slot: 3, key: process.env.API_KEY_3 }
+].filter(item => item.key && item.key.trim());
 
 const UPSTREAM_TIMEOUT = 120000;
 const MAX_REQUEST_SIZE = 2 * 1024 * 1024;
-const MAX_RESPONSE_SIZE = 64 * 1024 * 1024;
 
-// Shared active key for all incoming requests.
-// Starts at Key 1 and changes only after upstream errors or success.
 let activeKeyIndex = 0;
 
-class RetryableError extends Error {}
-
-function json(res, status, data) {
-  if (res.destroyed || res.writableEnded) return;
+function sendJson(res, status, data) {
+  if (res.headersSent) {
+    res.destroy();
+    return;
+  }
 
   res.writeHead(status, {
-    "Content-Type": "application/json"
+    "Content-Type": "application/json",
+    "Cache-Control": "no-cache"
   });
 
   res.end(JSON.stringify(data));
 }
 
-async function readRequest(req) {
-  const chunks = [];
-  let size = 0;
+function readRequest(req) {
+  return new Promise((resolve, reject) => {
+    let size = 0;
+    const chunks = [];
 
-  for await (const chunk of req) {
-    size += chunk.length;
+    req.on("data", chunk => {
+      size += chunk.length;
 
-    if (size > MAX_REQUEST_SIZE) {
-      throw new RetryableError("Request too large");
-    }
+      if (size > MAX_REQUEST_SIZE) {
+        reject(new Error("Request too large"));
+        req.destroy();
+        return;
+      }
 
-    chunks.push(chunk);
-  }
+      chunks.push(chunk);
+    });
 
-  return Buffer.concat(chunks).toString("utf8");
+    req.on("end", () => {
+      resolve(Buffer.concat(chunks));
+    });
+
+    req.on("error", reject);
+  });
 }
 
-async function readUpstream(response) {
-  if (!response.body) {
-    throw new RetryableError("Empty upstream body");
+async function sendUpstream(req, res, body) {
+  if (API_KEYS.length === 0) {
+    return sendJson(res, 500, {
+      error: { message: "No API keys configured." }
+    });
   }
 
-  const reader = response.body.getReader();
-  const chunks = [];
-  let size = 0;
+  const startIndex = activeKeyIndex;
+  let lastError = null;
 
-  try {
-    while (true) {
-      const result = await reader.read();
+  for (let attempt = 0; attempt < API_KEYS.length; attempt++) {
+    const keyIndex = (startIndex + attempt) % API_KEYS.length;
+    const keyEntry = API_KEYS[keyIndex];
 
-      if (result.done) break;
+    console.log(`Using active API key slot ${keyEntry.slot}`);
 
-      size += result.value.length;
+    const controller = new AbortController();
+    const timeout = setTimeout(
+      () => controller.abort(),
+      UPSTREAM_TIMEOUT
+    );
 
-      if (size > MAX_RESPONSE_SIZE) {
-        throw new RetryableError("Response too large");
-      }
+    let upstream;
 
-      chunks.push(Buffer.from(result.value));
-    }
+    try {
+      upstream = await fetch(UPSTREAM, {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${keyEntry.key}`,
+          "Content-Type": "application/json",
+          "Accept": "text/event-stream, application/json"
+        },
+        body,
+        signal: controller.signal
+      });
 
-    return Buffer.concat(chunks);
-  } catch (error) {
-    await reader.cancel().catch(() => {});
-    throw error;
-  } finally {
-    reader.releaseLock();
-  }
-}
+      if (!upstream.ok) {
+        const errorText = await upstream.text();
 
-function validateResponse(buffer, contentType) {
-  const text = buffer.toString("utf8").trim();
+        lastError = new Error(
+          `Upstream HTTP ${upstream.status}: ${errorText.slice(0, 1000)}`
+        );
 
-  if (!text) {
-    throw new RetryableError("Empty response");
-  }
+        console.error(
+          `API key slot ${keyEntry.slot} failed: HTTP ${upstream.status}`
+        );
 
-  const isSSE =
-    /text\/event-stream/i.test(contentType || "") ||
-    /(^|\n)(data:|event:)/m.test(text);
+        clearTimeout(timeout);
 
-  if (isSSE) {
-    let done = false;
-
-    for (const event of text.split(/\r?\n\r?\n/)) {
-      let eventName = "";
-      const data = [];
-
-      for (const line of event.split(/\r?\n/)) {
-        if (line.startsWith("event:")) {
-          eventName = line.slice(6).trim();
+        // Advance only if this key is still the active key.
+        if (activeKeyIndex === keyIndex) {
+          activeKeyIndex = (keyIndex + 1) % API_KEYS.length;
         }
 
-        if (line.startsWith("data:")) {
-          data.push(line.slice(5).trimStart());
-        }
-      }
-
-      const payload = data.join("\n");
-
-      if (eventName === "error") {
-        throw new RetryableError("SSE error event");
-      }
-
-      if (!payload) continue;
-
-      if (payload === "[DONE]") {
-        done = true;
         continue;
       }
 
-      let parsed;
+      // Successful key becomes the active key.
+      activeKeyIndex = keyIndex;
+
+      console.log(
+        `API key slot ${keyEntry.slot} succeeded. Active key retained.`
+      );
+
+      res.writeHead(upstream.status, {
+        "Content-Type":
+          upstream.headers.get("content-type") ||
+          "application/json",
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no"
+      });
+
+      if (!upstream.body) {
+        clearTimeout(timeout);
+        return res.end();
+      }
 
       try {
-        parsed = JSON.parse(payload);
-      } catch {
-        throw new RetryableError("Invalid SSE JSON");
+        for await (const chunk of upstream.body) {
+          if (res.destroyed) break;
+
+          if (!res.write(chunk)) {
+            await once(res, "drain");
+          }
+        }
+
+        clearTimeout(timeout);
+
+        if (!res.destroyed) {
+          res.end();
+        }
+      } catch (streamError) {
+        clearTimeout(timeout);
+        console.error("Upstream stream error:", streamError.message);
+
+        if (!res.destroyed) {
+          res.destroy(streamError);
+        }
       }
 
-      if (parsed?.error || parsed?.type === "error") {
-        throw new RetryableError("Upstream SSE error");
+      return;
+    } catch (error) {
+      clearTimeout(timeout);
+      lastError = error;
+
+      console.error(
+        `API key slot ${keyEntry.slot} failed: ${error.message}`
+      );
+
+      if (activeKeyIndex === keyIndex) {
+        activeKeyIndex = (keyIndex + 1) % API_KEYS.length;
       }
     }
+  }
 
-    if (!done) {
-      throw new RetryableError("Incomplete SSE stream");
+  console.error("All configured API keys failed.");
+
+  sendJson(res, 502, {
+    error: {
+      message: "All API keys failed.",
+      details: lastError ? lastError.message : "Unknown upstream error."
     }
-
-    return;
-  }
-
-  let parsed;
-
-  try {
-    parsed = JSON.parse(text);
-  } catch {
-    throw new RetryableError("Invalid JSON response");
-  }
-
-  if (parsed?.error) {
-    throw new RetryableError("Upstream JSON error");
-  }
+  });
 }
 
 const server = http.createServer(async (req, res) => {
@@ -175,184 +202,70 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(200, {
       "Content-Type": "text/plain"
     });
-
     return res.end("ok");
   }
 
   if (
     req.method !== "POST" ||
-    req.url !== "/v1/chat/completions"
+    req.url.split("?")[0] !== "/v1/chat/completions"
   ) {
-    return json(res, 404, {
-      error: "Not found"
+    return sendJson(res, 404, {
+      error: { message: "Not found." }
     });
   }
 
-  if (
-    !GATEWAY_APP_KEY ||
-    req.headers.authorization !== `Bearer ${GATEWAY_APP_KEY}`
-  ) {
-    return json(res, 401, {
-      error: "Invalid Gateway Key"
+  if (!GATEWAY_APP_KEY) {
+    return sendJson(res, 500, {
+      error: { message: "Gateway authentication is not configured." }
     });
   }
 
-  if (!API_KEYS.length) {
-    return json(res, 500, {
-      error: "No API keys configured"
+  const authorization = req.headers.authorization || "";
+  const suppliedKey = authorization.replace(/^Bearer\s+/i, "");
+
+  if (suppliedKey !== GATEWAY_APP_KEY) {
+    return sendJson(res, 401, {
+      error: { message: "Invalid Gateway Key." }
     });
   }
-
-  let clientGone = false;
-  let activeController = null;
-
-  res.on("close", () => {
-    if (!res.writableEnded) {
-      clientGone = true;
-      activeController?.abort();
-    }
-  });
-
-  let data;
 
   try {
     const body = await readRequest(req);
-    data = JSON.parse(body);
-  } catch (error) {
-    if (error.message === "Request too large") {
-      return json(res, 413, {
-        error: "Request too large"
+
+    if (!body.length) {
+      return sendJson(res, 400, {
+        error: { message: "Request body is empty." }
       });
     }
 
-    return json(res, 400, {
-      error: "Invalid request JSON"
-    });
-  }
-
-  if (
-    !data ||
-    typeof data !== "object" ||
-    Array.isArray(data)
-  ) {
-    return json(res, 400, {
-      error: "Invalid request body"
-    });
-  }
-
-  while (!clientGone) {
-    // Try every configured key once, starting from
-    // the currently remembered active key.
-    for (let attempt = 0; attempt < API_KEYS.length; attempt++) {
-      if (clientGone) return;
-
-      const keyIndex = activeKeyIndex;
-      const key = API_KEYS[keyIndex];
-
-      const controller = new AbortController();
-      activeController = controller;
-
-      let timeout;
-
-      try {
-        console.log(
-          `Trying API key slot ${keyIndex + 1}`
-        );
-
-        timeout = setTimeout(() => {
-          controller.abort();
-        }, UPSTREAM_TIMEOUT);
-
-        const upstream = await fetch(UPSTREAM, {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${key}`,
-            "Content-Type": "application/json",
-            Accept: "application/json, text/event-stream"
-          },
-          body: JSON.stringify(data),
-          signal: controller.signal
-        });
-
-        if (!upstream.ok) {
-          const status = upstream.status;
-
-          await upstream.body?.cancel().catch(() => {});
-
-          throw new RetryableError(`HTTP ${status}`);
-        }
-
-        const contentType =
-          upstream.headers.get("content-type") ||
-          "application/json";
-
-        const responseBody = await readUpstream(upstream);
-
-        validateResponse(responseBody, contentType);
-
-        if (clientGone) return;
-
-        clearTimeout(timeout);
-        activeController = null;
-
-        // Remember the successful key for future messages.
-        activeKeyIndex = keyIndex;
-
-        console.log(
-          `API key slot ${keyIndex + 1} succeeded. Active key retained.`
-        );
-
-        res.writeHead(upstream.status, {
-          "Content-Type": contentType,
-          "Cache-Control": "no-cache",
-          "X-Accel-Buffering": "no",
-          "Content-Length": responseBody.length
-        });
-
-        return res.end(responseBody);
-
-      } catch (error) {
-        clearTimeout(timeout);
-        activeController = null;
-
-        if (clientGone) return;
-
-        const reason = controller.signal.aborted
-          ? "timeout"
-          : error.message;
-
-        console.warn(
-          `API key slot ${keyIndex + 1} failed: ${reason}`
-        );
-
-        // Move to the next key only after an error.
-        // Other concurrent requests may have changed
-        // the active key, so do not overwrite their choice.
-        if (activeKeyIndex === keyIndex) {
-          activeKeyIndex =
-            (keyIndex + 1) % API_KEYS.length;
-        }
-
-        console.log(
-          `Next active API key slot ${activeKeyIndex + 1}`
-        );
-      }
+    try {
+      JSON.parse(body.toString("utf8"));
+    } catch {
+      return sendJson(res, 400, {
+        error: { message: "Invalid JSON request body." }
+      });
     }
 
-    if (clientGone) return;
+    await sendUpstream(req, res, body);
+  } catch (error) {
+    console.error("Gateway request error:", error.message);
 
-    console.warn(
-      `All API keys failed. Restarting immediately from active key ${activeKeyIndex + 1}.`
-    );
+    if (!res.headersSent) {
+      sendJson(res, 500, {
+        error: { message: error.message }
+      });
+    } else {
+      res.destroy(error);
+    }
   }
 });
 
 server.listen(PORT, () => {
+  console.log(`Troy Gateway running on port ${PORT}`);
+  console.log(`Configured API keys: ${API_KEYS.length}`);
   console.log(
-    `Universal API Gateway running on port ${PORT}`
-  );
-
-  console.log(
-    `Initial active API key slot: ${activeKeyIndex + 1}`
+    `Initial active key: ${
+      API_KEYS.length ? API_KEYS[activeKeyIndex].slot : "NONE"
+    }`
   );
 });
