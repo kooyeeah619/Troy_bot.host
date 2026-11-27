@@ -1,5 +1,4 @@
 const http = require("http");
-const { once } = require("events");
 
 const PORT = process.env.PORT || 3000;
 const UPSTREAM = "https://100milionseek.top/v1/chat/completions";
@@ -18,10 +17,7 @@ const MAX_REQUEST_SIZE = 2 * 1024 * 1024;
 let activeKeyIndex = 0;
 
 function sendJson(res, status, data) {
-  if (res.headersSent) {
-    res.destroy();
-    return;
-  }
+  if (res.headersSent || res.destroyed) return;
 
   res.writeHead(status, {
     "Content-Type": "application/json",
@@ -35,11 +31,15 @@ function readRequest(req) {
   return new Promise((resolve, reject) => {
     let size = 0;
     const chunks = [];
+    let finished = false;
 
     req.on("data", chunk => {
+      if (finished) return;
+
       size += chunk.length;
 
       if (size > MAX_REQUEST_SIZE) {
+        finished = true;
         reject(new Error("Request too large"));
         req.destroy();
         return;
@@ -49,10 +49,38 @@ function readRequest(req) {
     });
 
     req.on("end", () => {
+      if (finished) return;
+      finished = true;
       resolve(Buffer.concat(chunks));
     });
 
-    req.on("error", reject);
+    req.on("error", error => {
+      if (finished) return;
+      finished = true;
+      reject(error);
+    });
+  });
+}
+
+function waitForDrainOrClose(res) {
+  return new Promise(resolve => {
+    const cleanup = () => {
+      res.off("drain", onDrain);
+      res.off("close", onClose);
+    };
+
+    const onDrain = () => {
+      cleanup();
+      resolve(true);
+    };
+
+    const onClose = () => {
+      cleanup();
+      resolve(false);
+    };
+
+    res.once("drain", onDrain);
+    res.once("close", onClose);
   });
 }
 
@@ -67,21 +95,49 @@ async function sendUpstream(req, res, body) {
   let lastError = null;
 
   for (let attempt = 0; attempt < API_KEYS.length; attempt++) {
+    if (res.destroyed) return;
+
     const keyIndex = (startIndex + attempt) % API_KEYS.length;
     const keyEntry = API_KEYS[keyIndex];
 
     console.log(`Using active API key slot ${keyEntry.slot}`);
 
     const controller = new AbortController();
-    const timeout = setTimeout(
-      () => controller.abort(),
-      UPSTREAM_TIMEOUT
-    );
 
-    let upstream;
+    let timeout = null;
+    let timedOut = false;
+    let timeoutPhase = "upstream response headers";
+
+    function armTimeout(phase) {
+      clearTimeout(timeout);
+
+      timeoutPhase = phase;
+      timedOut = false;
+
+      timeout = setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+      }, UPSTREAM_TIMEOUT);
+    }
+
+    function clearActiveTimeout() {
+      clearTimeout(timeout);
+      timeout = null;
+    }
+
+    const onClientClose = () => {
+      if (!res.writableEnded) {
+        controller.abort();
+      }
+    };
+
+    res.once("close", onClientClose);
 
     try {
-      upstream = await fetch(UPSTREAM, {
+      // Timeout applies while waiting for upstream headers.
+      armTimeout("upstream response headers");
+
+      const upstream = await fetch(UPSTREAM, {
         method: "POST",
         headers: {
           "Authorization": `Bearer ${keyEntry.key}`,
@@ -91,6 +147,12 @@ async function sendUpstream(req, res, body) {
         body,
         signal: controller.signal
       });
+
+      if (res.destroyed) {
+        clearActiveTimeout();
+        res.off("close", onClientClose);
+        return;
+      }
 
       if (!upstream.ok) {
         const errorText = await upstream.text();
@@ -103,9 +165,9 @@ async function sendUpstream(req, res, body) {
           `API key slot ${keyEntry.slot} failed: HTTP ${upstream.status}`
         );
 
-        clearTimeout(timeout);
+        clearActiveTimeout();
+        res.off("close", onClientClose);
 
-        // Advance only if this key is still the active key.
         if (activeKeyIndex === keyIndex) {
           activeKeyIndex = (keyIndex + 1) % API_KEYS.length;
         }
@@ -113,12 +175,16 @@ async function sendUpstream(req, res, body) {
         continue;
       }
 
-      // Successful key becomes the active key.
+      // Successful key becomes active.
       activeKeyIndex = keyIndex;
 
       console.log(
         `API key slot ${keyEntry.slot} succeeded. Active key retained.`
       );
+
+      // IMPORTANT:
+      // Stop the initial header timeout immediately.
+      clearActiveTimeout();
 
       res.writeHead(upstream.status, {
         "Content-Type":
@@ -129,41 +195,86 @@ async function sendUpstream(req, res, body) {
       });
 
       if (!upstream.body) {
-        clearTimeout(timeout);
-        return res.end();
+        res.end();
+        res.off("close", onClientClose);
+        return;
       }
 
+      // A separate inactivity timeout protects stalled streams.
+      // It resets whenever another chunk arrives.
+      armTimeout("stream inactivity");
+
+      const reader = upstream.body.getReader();
+
       try {
-        for await (const chunk of upstream.body) {
+        while (true) {
+          const result = await reader.read();
+
+          if (result.done) break;
           if (res.destroyed) break;
 
-          if (!res.write(chunk)) {
-            await once(res, "drain");
+          // Data arrived: reset inactivity timeout.
+          armTimeout("stream inactivity");
+
+          if (!res.write(result.value)) {
+            const drained = await waitForDrainOrClose(res);
+
+            if (!drained) break;
           }
         }
 
-        clearTimeout(timeout);
+        clearActiveTimeout();
 
-        if (!res.destroyed) {
+        if (!res.destroyed && !res.writableEnded) {
           res.end();
         }
+
       } catch (streamError) {
-        clearTimeout(timeout);
-        console.error("Upstream stream error:", streamError.message);
+        clearActiveTimeout();
+
+        if (timedOut) {
+          console.error(
+            `Upstream stream inactivity timeout after ${UPSTREAM_TIMEOUT / 1000}s`
+          );
+        } else {
+          console.error(
+            "Upstream stream error:",
+            streamError.message
+          );
+        }
 
         if (!res.destroyed) {
           res.destroy(streamError);
         }
+
+      } finally {
+        try {
+          reader.releaseLock();
+        } catch {}
+
+        res.off("close", onClientClose);
       }
 
+      // Never retry another key after response headers were sent.
       return;
+
     } catch (error) {
-      clearTimeout(timeout);
+      clearActiveTimeout();
+      res.off("close", onClientClose);
+
+      if (res.destroyed) return;
+
       lastError = error;
 
-      console.error(
-        `API key slot ${keyEntry.slot} failed: ${error.message}`
-      );
+      if (timedOut) {
+        console.error(
+          `API key slot ${keyEntry.slot} timed out waiting for ${timeoutPhase}`
+        );
+      } else {
+        console.error(
+          `API key slot ${keyEntry.slot} failed: ${error.message}`
+        );
+      }
 
       if (activeKeyIndex === keyIndex) {
         activeKeyIndex = (keyIndex + 1) % API_KEYS.length;
@@ -176,7 +287,9 @@ async function sendUpstream(req, res, body) {
   sendJson(res, 502, {
     error: {
       message: "All API keys failed.",
-      details: lastError ? lastError.message : "Unknown upstream error."
+      details: lastError
+        ? lastError.message
+        : "Unknown upstream error."
     }
   });
 }
@@ -201,6 +314,7 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(200, {
       "Content-Type": "text/plain"
     });
+
     return res.end("ok");
   }
 
@@ -215,7 +329,9 @@ const server = http.createServer(async (req, res) => {
 
   if (!GATEWAY_APP_KEY) {
     return sendJson(res, 500, {
-      error: { message: "Gateway authentication is not configured." }
+      error: {
+        message: "Gateway authentication is not configured."
+      }
     });
   }
 
@@ -246,6 +362,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     await sendUpstream(req, res, body);
+
   } catch (error) {
     console.error("Gateway request error:", error.message);
 
@@ -253,7 +370,7 @@ const server = http.createServer(async (req, res) => {
       sendJson(res, 500, {
         error: { message: error.message }
       });
-    } else {
+    } else if (!res.destroyed) {
       res.destroy(error);
     }
   }
@@ -262,9 +379,12 @@ const server = http.createServer(async (req, res) => {
 server.listen(PORT, () => {
   console.log(`Troy Gateway running on port ${PORT}`);
   console.log(`Configured API keys: ${API_KEYS.length}`);
+
   console.log(
     `Initial active key: ${
-      API_KEYS.length ? API_KEYS[activeKeyIndex].slot : "NONE"
+      API_KEYS.length
+        ? API_KEYS[activeKeyIndex].slot
+        : "NONE"
     }`
   );
 });
