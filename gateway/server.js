@@ -10,27 +10,63 @@ const API_KEYS = [
   { slot: 3, key: process.env.API_KEY_3 }
 ].filter(item => item.key && item.key.trim());
 
-const UPSTREAM_TIMEOUT = 180000; // 3 minutes (para sa thinking)
+const UPSTREAM_TIMEOUT = 180000; // 3 minutes
 const MAX_REQUEST_SIZE = 20 * 1024 * 1024;
-const SSE_PREFLIGHT_CHUNKS = 2; // 2 chunks sapat na para ma-validate
-const SSE_PREFLIGHT_MAX_BYTES = 8192;
+const SSE_PREFLIGHT_CHUNKS = 4; // Nadagdagan para masalo yung buong error message
+const SSE_PREFLIGHT_MAX_BYTES = 16384;
 
 let activeKeyIndex = 0;
+let keyStateVersion = 0;
+
+function setActiveKey(index, reason) {
+  if (!API_KEYS.length || index < 0 || index >= API_KEYS.length) return;
+
+  if (activeKeyIndex !== index) {
+    const previous = activeKeyIndex;
+    activeKeyIndex = index;
+    keyStateVersion++;
+
+    console.log(
+      `Active API key changed: slot ${API_KEYS[previous].slot} -> slot ${API_KEYS[index].slot} (${reason})`
+    );
+  }
+}
+
+function advanceKey(keyIndex) {
+  if (!API_KEYS.length) return;
+
+  if (activeKeyIndex !== keyIndex) {
+    console.log(
+      `Ignoring stale failure from slot ${API_KEYS[keyIndex].slot}; active key has changed.`
+    );
+    return;
+  }
+
+  const nextIndex = (keyIndex + 1) % API_KEYS.length;
+  setActiveKey(nextIndex, "upstream failure");
+}
 
 function sendJson(res, status, data) {
   if (res.headersSent || res.destroyed) return;
-  res.writeHead(status, { "Content-Type": "application/json", "Cache-Control": "no-cache" });
+
+  res.writeHead(status, {
+    "Content-Type": "application/json",
+    "Cache-Control": "no-cache"
+  });
+
   res.end(JSON.stringify(data));
 }
 
 function isBusyResponse(value) {
-  return /service\s+is\s+busy\s+right\s+now|passes\s+from\s+\$?1\s+raise\s+your\s+limits|temporarily\s+unavailable|upstream\s+busy/i.test(value);
+  // Pinalawak na regex para masalo lahat ng variation ng "busy" o limit errors
+  return /service\s+is\s+busy|passes\s+from|raise\s+your\s+limits|temporarily\s+unavailable|upstream\s+busy|too\s+many\s+requests|rate\s+limit/i.test(value);
 }
 
-function advanceKey(keyIndex) {
-  if (API_KEYS.length && activeKeyIndex === keyIndex) {
-    activeKeyIndex = (keyIndex + 1) % API_KEYS.length;
-    console.log(`API key rotation: slot ${API_KEYS[keyIndex].slot} -> slot ${API_KEYS[activeKeyIndex].slot}`);
+class RequestTooLargeError extends Error {
+  constructor() {
+    super("Request body exceeds the 20 MB limit.");
+    this.name = "RequestTooLargeError";
+    this.statusCode = 413;
   }
 }
 
@@ -39,22 +75,45 @@ function readRequest(req) {
     let size = 0;
     let finished = false;
     const chunks = [];
+
+    function rejectRequest(error) {
+      if (finished) return;
+      finished = true;
+      chunks.length = 0;
+      req.resume(); // Drain remaining upload
+      reject(error);
+    }
+
+    const contentLength = Number(req.headers["content-length"]);
+
+    if (Number.isFinite(contentLength) && contentLength > MAX_REQUEST_SIZE) {
+      rejectRequest(new RequestTooLargeError());
+      return;
+    }
+
     req.on("data", chunk => {
       if (finished) return;
       size += chunk.length;
+
       if (size > MAX_REQUEST_SIZE) {
-        finished = true;
-        reject(new Error("Request too large"));
-        req.destroy();
+        rejectRequest(new RequestTooLargeError());
         return;
       }
       chunks.push(chunk);
     });
+
     req.on("end", () => {
       if (finished) return;
       finished = true;
       resolve(Buffer.concat(chunks));
     });
+
+    req.on("aborted", () => {
+      if (finished) return;
+      finished = true;
+      reject(new Error("Client aborted the request."));
+    });
+
     req.on("error", error => {
       if (finished) return;
       finished = true;
@@ -66,18 +125,33 @@ function readRequest(req) {
 function waitForDrain(res) {
   return new Promise(resolve => {
     if (res.destroyed || res.writableEnded) return resolve(false);
+
     const cleanup = () => {
       res.off("drain", onDrain);
       res.off("close", onClose);
       res.off("error", onError);
     };
+
     const onDrain = () => { cleanup(); resolve(true); };
     const onClose = () => { cleanup(); resolve(false); };
     const onError = () => { cleanup(); resolve(false); };
+
     res.once("drain", onDrain);
     res.once("close", onClose);
     res.once("error", onError);
   });
+}
+
+function getNextUntriedKey(attemptedKeys) {
+  if (!API_KEYS.length) return -1;
+
+  for (let offset = 0; offset < API_KEYS.length; offset++) {
+    const index = (activeKeyIndex + offset) % API_KEYS.length;
+    if (!attemptedKeys.has(index)) {
+      return index;
+    }
+  }
+  return -1;
 }
 
 async function sendUpstream(req, res, body) {
@@ -85,13 +159,16 @@ async function sendUpstream(req, res, body) {
     return sendJson(res, 500, { error: { message: "No API keys configured." } });
   }
 
-  const startIndex = activeKeyIndex;
   let lastError = null;
+  const attemptedKeys = new Set();
 
   for (let attempt = 0; attempt < API_KEYS.length; attempt++) {
     if (res.destroyed) return;
 
-    const keyIndex = (startIndex + attempt) % API_KEYS.length;
+    const keyIndex = getNextUntriedKey(attemptedKeys);
+    if (keyIndex < 0) break;
+
+    attemptedKeys.add(keyIndex);
     const keyEntry = API_KEYS[keyIndex];
 
     console.log(`Using active API key slot ${keyEntry.slot}`);
@@ -146,6 +223,7 @@ async function sendUpstream(req, res, body) {
         let errorText = "";
         try { errorText = await upstream.text(); } catch (error) { errorText = error.message; }
         clearActiveTimeout();
+
         lastError = new Error(`Upstream HTTP ${upstream.status}: ${errorText.slice(0, 1000)}`);
         console.error(`API key slot ${keyEntry.slot} failed: HTTP ${upstream.status}`);
         res.off("close", onClientClose);
@@ -177,11 +255,13 @@ async function sendUpstream(req, res, body) {
 
           for (let i = 0; i < SSE_PREFLIGHT_CHUNKS; i++) {
             const result = await reader.read();
-            armTimeout(); // <--- CRITICAL: Reset timeout on every chunk
+            armTimeout();
+
             if (result.done) { streamFinished = true; break; }
             buffered.push(result.value);
             bufferedSize += result.value.byteLength;
             inspected += decoder.decode(result.value, { stream: true });
+
             if (isBusyResponse(inspected)) { retryBusy = true; break; }
             if (bufferedSize >= SSE_PREFLIGHT_MAX_BYTES) break;
           }
@@ -190,7 +270,7 @@ async function sendUpstream(req, res, body) {
         } else {
           while (true) {
             const result = await reader.read();
-            armTimeout(); // <--- CRITICAL: Reset timeout on every chunk
+            armTimeout();
             if (result.done) { streamFinished = true; break; }
             buffered.push(result.value);
             bufferedSize += result.value.byteLength;
@@ -201,8 +281,10 @@ async function sendUpstream(req, res, body) {
       } catch (preflightError) {
         clearActiveTimeout();
         if (res.destroyed) { res.off("close", onClientClose); return; }
+
         lastError = new Error(timedOut ? "Upstream preflight timeout." : `Upstream preflight error: ${preflightError.message}`);
         console.error(`API key slot ${keyEntry.slot} preflight failed:`, lastError.message);
+
         try { await reader.cancel(); } catch {}
         res.off("close", onClientClose);
         advanceKey(keyIndex);
@@ -222,7 +304,8 @@ async function sendUpstream(req, res, body) {
 
       if (res.destroyed) { try { await reader.cancel(); } catch {} res.off("close", onClientClose); return; }
 
-      activeKeyIndex = keyIndex;
+      setActiveKey(keyIndex, "successful preflight");
+
       console.log(`API key slot ${keyEntry.slot} passed preflight. Active key retained.`);
 
       res.writeHead(upstream.status, {
@@ -254,7 +337,7 @@ async function sendUpstream(req, res, body) {
 
       clearActiveTimeout();
 
-      if (!res.destroyed && !res.writableEnded) res.end();
+      if (!res.destroyed && !res.writableEnded) { res.end(); }
 
       if (streamFinished) {
         console.log(`API key slot ${keyEntry.slot} response completed successfully.`);
@@ -271,8 +354,8 @@ async function sendUpstream(req, res, body) {
       if (res.headersSent) {
         console.error(`API key slot ${keyEntry.slot} stream failed after response started:`, timedOut ? "timeout" : error.message);
         advanceKey(keyIndex);
-        console.log(`Next request will use the current active API key slot ${API_KEYS[activeKeyIndex].slot}.`);
-        if (!res.destroyed) res.destroy(error);
+        console.log(`Next request will use active API key slot ${API_KEYS[activeKeyIndex].slot}.`);
+        if (!res.destroyed) { res.destroy(error); }
         res.off("close", onClientClose);
         return;
       }
@@ -292,6 +375,7 @@ async function sendUpstream(req, res, body) {
   }
 
   console.error("All configured API keys failed.");
+
   sendJson(res, 502, {
     error: { message: "All API keys failed.", details: lastError ? lastError.message : "Unknown upstream error." }
   });
@@ -331,8 +415,12 @@ const server = http.createServer(async (req, res) => {
     await sendUpstream(req, res, body);
   } catch (error) {
     console.error("Gateway request error:", error.message);
-    if (!res.headersSent) sendJson(res, 500, { error: { message: error.message } });
-    else if (!res.destroyed) res.destroy(error);
+    if (!res.headersSent) {
+      const status = error.statusCode === 413 ? 413 : 500;
+      sendJson(res, status, { error: { message: error.message } });
+    } else if (!res.destroyed) {
+      res.destroy(error);
+    }
   }
 });
 
