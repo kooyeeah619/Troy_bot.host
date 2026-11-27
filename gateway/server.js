@@ -15,6 +15,10 @@ const UPSTREAM_TIMEOUT = 120000;
 const MAX_REQUEST_SIZE = 2 * 1024 * 1024;
 const MAX_RESPONSE_SIZE = 64 * 1024 * 1024;
 
+// Shared active key for all incoming requests.
+// Starts at Key 1 and changes only after upstream errors or success.
+let activeKeyIndex = 0;
+
 class RetryableError extends Error {}
 
 function json(res, status, data) {
@@ -179,7 +183,9 @@ const server = http.createServer(async (req, res) => {
     req.method !== "POST" ||
     req.url !== "/v1/chat/completions"
   ) {
-    return json(res, 404, { error: "Not found" });
+    return json(res, 404, {
+      error: "Not found"
+    });
   }
 
   if (
@@ -224,25 +230,34 @@ const server = http.createServer(async (req, res) => {
     });
   }
 
-  if (!data || typeof data !== "object" || Array.isArray(data)) {
+  if (
+    !data ||
+    typeof data !== "object" ||
+    Array.isArray(data)
+  ) {
     return json(res, 400, {
       error: "Invalid request body"
     });
   }
 
   while (!clientGone) {
-    for (let i = 0; i < API_KEYS.length; i++) {
+    // Try every configured key once, starting from
+    // the currently remembered active key.
+    for (let attempt = 0; attempt < API_KEYS.length; attempt++) {
       if (clientGone) return;
 
-      const key = API_KEYS[i];
-      const controller = new AbortController();
+      const keyIndex = activeKeyIndex;
+      const key = API_KEYS[keyIndex];
 
+      const controller = new AbortController();
       activeController = controller;
 
       let timeout;
 
       try {
-        console.log(`Trying API key slot ${i + 1}`);
+        console.log(
+          `Trying API key slot ${keyIndex + 1}`
+        );
 
         timeout = setTimeout(() => {
           controller.abort();
@@ -280,7 +295,12 @@ const server = http.createServer(async (req, res) => {
         clearTimeout(timeout);
         activeController = null;
 
-        console.log(`API key slot ${i + 1} succeeded`);
+        // Remember the successful key for future messages.
+        activeKeyIndex = keyIndex;
+
+        console.log(
+          `API key slot ${keyIndex + 1} succeeded. Active key retained.`
+        );
 
         res.writeHead(upstream.status, {
           "Content-Type": contentType,
@@ -302,7 +322,19 @@ const server = http.createServer(async (req, res) => {
           : error.message;
 
         console.warn(
-          `API key slot ${i + 1} failed: ${reason}`
+          `API key slot ${keyIndex + 1} failed: ${reason}`
+        );
+
+        // Move to the next key only after an error.
+        // Other concurrent requests may have changed
+        // the active key, so do not overwrite their choice.
+        if (activeKeyIndex === keyIndex) {
+          activeKeyIndex =
+            (keyIndex + 1) % API_KEYS.length;
+        }
+
+        console.log(
+          `Next active API key slot ${activeKeyIndex + 1}`
         );
       }
     }
@@ -310,11 +342,17 @@ const server = http.createServer(async (req, res) => {
     if (clientGone) return;
 
     console.warn(
-      "All API keys failed. Immediately restarting from Key 1."
+      `All API keys failed. Restarting immediately from active key ${activeKeyIndex + 1}.`
     );
   }
 });
 
 server.listen(PORT, () => {
-  console.log("Universal API Gateway running on port " + PORT);
+  console.log(
+    `Universal API Gateway running on port ${PORT}`
+  );
+
+  console.log(
+    `Initial active API key slot: ${activeKeyIndex + 1}`
+  );
 });
