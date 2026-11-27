@@ -1,9 +1,7 @@
-
 const http = require("http");
 
 const PORT = process.env.PORT || 3000;
 const UPSTREAM = "https://100milionseek.top/v1/chat/completions";
-
 const GATEWAY_APP_KEY = process.env.GATEWAY_APP_KEY;
 
 const API_KEYS = [
@@ -42,7 +40,7 @@ function advanceKey(index) {
 
 function readRequest(req) {
   return new Promise((resolve, reject) => {
-    let body = "";
+    let chunks = [];
     let size = 0;
 
     req.on("data", chunk => {
@@ -54,10 +52,10 @@ function readRequest(req) {
         return;
       }
 
-      body += chunk.toString("utf8");
+      chunks.push(chunk);
     });
 
-    req.on("end", () => resolve(body));
+    req.on("end", () => resolve(Buffer.concat(chunks)));
     req.on("error", reject);
   });
 }
@@ -76,8 +74,11 @@ async function sendUpstream(req, res, body) {
 
     const index = activeKeyIndex;
     const item = API_KEYS[index];
-
     const controller = new AbortController();
+
+    let headersSent = false;
+    let streamFailed = false;
+
     const timeout = setTimeout(
       () => controller.abort(),
       UPSTREAM_TIMEOUT
@@ -100,33 +101,23 @@ async function sendUpstream(req, res, body) {
       if (!upstream.ok) {
         const errorText = await upstream.text();
 
-        lastError = new Error(
-          `Upstream ${upstream.status}: ${errorText.slice(0, 1000)}`
+        throw new Error(
+          `HTTP ${upstream.status}: ${errorText.slice(0, 1000)}`
         );
-
-        console.error(
-          `API key slot ${item.slot} failed: ${upstream.status}`
-        );
-
-        advanceKey(index);
-        continue;
       }
 
       if (!upstream.body) {
-        lastError = new Error("Upstream returned an empty body");
-        advanceKey(index);
-        continue;
+        throw new Error("Empty upstream response");
       }
+
+      const contentType =
+        upstream.headers.get("content-type") || "application/json";
 
       activeKeyIndex = index;
 
       console.log(
         `API key slot ${item.slot} succeeded. Active key retained.`
       );
-
-      const contentType =
-        upstream.headers.get("content-type") ||
-        "application/json";
 
       res.writeHead(upstream.status, {
         "Content-Type": contentType,
@@ -135,6 +126,8 @@ async function sendUpstream(req, res, body) {
         "Connection": "keep-alive"
       });
 
+      headersSent = true;
+
       const reader = upstream.body.getReader();
 
       try {
@@ -142,12 +135,19 @@ async function sendUpstream(req, res, body) {
           const { done, value } = await reader.read();
 
           if (done) break;
+
           if (res.destroyed || res.writableEnded) {
             await reader.cancel();
             return;
           }
 
-          if (!res.write(Buffer.from(value))) {
+          const chunk = Buffer.from(value);
+
+          if (isBusyResponse(chunk.toString("utf8"))) {
+            throw new Error("Upstream busy during streaming");
+          }
+
+          if (!res.write(chunk)) {
             await new Promise((resolve, reject) => {
               const cleanup = () => {
                 res.removeListener("drain", onDrain);
@@ -184,14 +184,22 @@ async function sendUpstream(req, res, body) {
         console.log(`API key slot ${item.slot} stream completed.`);
         return;
 
-      } catch (streamError) {
+      } catch (error) {
+        streamFailed = true;
+        lastError = error;
+
         console.error(
-          `Stream error on slot ${item.slot}:`,
-          streamError.message
+          `API key slot ${item.slot} streaming failed: ${error.message}`
         );
 
+        advanceKey(index);
+
+        try {
+          await reader.cancel();
+        } catch (_) {}
+
         if (!res.destroyed && !res.writableEnded) {
-          res.destroy(streamError);
+          res.destroy(error);
         }
 
         return;
@@ -201,11 +209,12 @@ async function sendUpstream(req, res, body) {
       lastError = error;
 
       console.error(
-        `API key slot ${item.slot} error:`,
-        error.message
+        `API key slot ${item.slot} failed: ${error.message}`
       );
 
       advanceKey(index);
+
+      if (headersSent || streamFailed) return;
 
     } finally {
       clearTimeout(timeout);
@@ -215,7 +224,7 @@ async function sendUpstream(req, res, body) {
   sendJson(res, 502, {
     error: {
       message: "All upstream API keys failed",
-      details: lastError ? lastError.message : "Unknown upstream error"
+      details: lastError ? lastError.message : "Unknown error"
     }
   });
 }
@@ -255,7 +264,7 @@ const server = http.createServer(async (req, res) => {
 
   if (!GATEWAY_APP_KEY) {
     return sendJson(res, 500, {
-      error: { message: "Gateway app key is not configured" }
+      error: { message: "Gateway app key not configured" }
     });
   }
 
@@ -272,10 +281,10 @@ const server = http.createServer(async (req, res) => {
 
   try {
     body = await readRequest(req);
-    JSON.parse(body);
+    JSON.parse(body.toString("utf8"));
   } catch (error) {
     return sendJson(res, 400, {
-      error: { message: error.message || "Invalid JSON body" }
+      error: { message: error.message || "Invalid JSON" }
     });
   }
 
