@@ -36,6 +36,10 @@ function isBusyResponse(value) {
 function advanceKey(keyIndex) {
   if (API_KEYS.length && activeKeyIndex === keyIndex) {
     activeKeyIndex = (keyIndex + 1) % API_KEYS.length;
+
+    console.log(
+      `API key rotation: slot ${API_KEYS[keyIndex].slot} -> slot ${API_KEYS[activeKeyIndex].slot}`
+    );
   }
 }
 
@@ -152,7 +156,6 @@ async function sendUpstream(req, res, body) {
     res.once("close", onClientClose);
 
     let reader = null;
-    let retryBeforeHeaders = false;
 
     try {
       armTimeout();
@@ -407,12 +410,19 @@ async function sendUpstream(req, res, body) {
         return;
       }
 
-      // If headers were already sent, a transparent retry could
-      // duplicate or corrupt the answer. Do not retry at this point.
+      // Mid-stream failure: rotate the key for the NEXT request.
+      // The current response cannot be transparently retried
+      // after response headers or stream data have been sent.
       if (res.headersSent) {
         console.error(
           `API key slot ${keyEntry.slot} stream failed after response started:`,
           timedOut ? "timeout" : error.message
+        );
+
+        advanceKey(keyIndex);
+
+        console.log(
+          `Next request will use the current active API key slot ${API_KEYS[activeKeyIndex].slot}.`
         );
 
         if (!res.destroyed) res.destroy(error);
@@ -439,6 +449,7 @@ async function sendUpstream(req, res, body) {
 
       res.off("close", onClientClose);
       advanceKey(keyIndex);
+
     } finally {
       clearActiveTimeout();
 
