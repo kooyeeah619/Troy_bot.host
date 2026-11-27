@@ -13,6 +13,7 @@ const API_KEYS = [
 const UPSTREAM_TIMEOUT = 120000;
 const MAX_REQUEST_SIZE = 2 * 1024 * 1024;
 const SSE_PREFLIGHT_CHUNKS = 8;
+const SSE_PREFLIGHT_MAX_BYTES = 16384;
 
 let activeKeyIndex = 0;
 
@@ -32,7 +33,7 @@ function isBusyResponse(value) {
 }
 
 function advanceKey(keyIndex) {
-  if (activeKeyIndex === keyIndex) {
+  if (API_KEYS.length && activeKeyIndex === keyIndex) {
     activeKeyIndex = (keyIndex + 1) % API_KEYS.length;
   }
 }
@@ -69,6 +70,37 @@ function readRequest(req) {
       finished = true;
       reject(error);
     });
+  });
+}
+
+function waitForDrain(res) {
+  return new Promise(resolve => {
+    if (res.destroyed || res.writableEnded) return resolve(false);
+
+    const cleanup = () => {
+      res.off("drain", onDrain);
+      res.off("close", onClose);
+      res.off("error", onError);
+    };
+
+    const onDrain = () => {
+      cleanup();
+      resolve(true);
+    };
+
+    const onClose = () => {
+      cleanup();
+      resolve(false);
+    };
+
+    const onError = () => {
+      cleanup();
+      resolve(false);
+    };
+
+    res.once("drain", onDrain);
+    res.once("close", onClose);
+    res.once("error", onError);
   });
 }
 
@@ -110,13 +142,18 @@ async function sendUpstream(req, res, body) {
     }
 
     const onClientClose = () => {
-      if (!res.writableEnded) controller.abort();
+      if (!res.writableEnded) {
+        console.log("Client disconnected. Aborting upstream request.");
+        controller.abort();
+      }
     };
 
     res.once("close", onClientClose);
 
+    let reader = null;
+    let retryBeforeHeaders = false;
+
     try {
-      // Timeout only while waiting for upstream headers.
       armTimeout();
 
       const upstream = await fetch(UPSTREAM, {
@@ -130,15 +167,22 @@ async function sendUpstream(req, res, body) {
         signal: controller.signal
       });
 
-      clearActiveTimeout();
-
       if (res.destroyed) {
+        clearActiveTimeout();
         res.off("close", onClientClose);
         return;
       }
 
       if (!upstream.ok) {
-        const errorText = await upstream.text();
+        let errorText = "";
+
+        try {
+          errorText = await upstream.text();
+        } catch (error) {
+          errorText = error.message;
+        }
+
+        clearActiveTimeout();
 
         lastError = new Error(
           `Upstream HTTP ${upstream.status}: ${errorText.slice(0, 1000)}`
@@ -154,7 +198,14 @@ async function sendUpstream(req, res, body) {
       }
 
       if (!upstream.body) {
+        clearActiveTimeout();
+
         lastError = new Error("Upstream returned an empty response.");
+
+        console.error(
+          `API key slot ${keyEntry.slot} returned an empty response.`
+        );
+
         res.off("close", onClientClose);
         advanceKey(keyIndex);
         continue;
@@ -163,55 +214,60 @@ async function sendUpstream(req, res, body) {
       const contentType =
         upstream.headers.get("content-type") || "application/json";
 
-      const reader = upstream.body.getReader();
+      reader = upstream.body.getReader();
+
       const buffered = [];
       let bufferedSize = 0;
       let retryBusy = false;
+      let streamFinished = false;
 
-      // Separate inactivity timeout for response reading.
-      armTimeout();
-
+      // Preflight: errors here can still safely retry another key.
       try {
         if (contentType.toLowerCase().includes("text/event-stream")) {
-          // Inspect a small initial part of SSE before sending it.
-          // This catches upstream busy messages returned as assistant text.
           let inspected = "";
+          const decoder = new TextDecoder();
 
           for (let i = 0; i < SSE_PREFLIGHT_CHUNKS; i++) {
             const result = await reader.read();
 
-            if (result.done) break;
+            if (result.done) {
+              streamFinished = true;
+              break;
+            }
 
             buffered.push(result.value);
             bufferedSize += result.value.byteLength;
 
-            inspected += new TextDecoder().decode(
-              result.value,
-              { stream: true }
-            );
-
-            armTimeout();
+            inspected += decoder.decode(result.value, {
+              stream: true
+            });
 
             if (isBusyResponse(inspected)) {
               retryBusy = true;
               break;
             }
 
-            // Avoid buffering an unexpectedly large initial response.
-            if (bufferedSize >= 16384) break;
+            if (bufferedSize >= SSE_PREFLIGHT_MAX_BYTES) break;
+          }
+
+          inspected += decoder.decode();
+
+          if (isBusyResponse(inspected)) {
+            retryBusy = true;
           }
 
         } else {
-          // Non-streaming JSON: inspect the complete response.
+          // JSON response: inspect the complete body before forwarding.
           while (true) {
             const result = await reader.read();
 
-            if (result.done) break;
+            if (result.done) {
+              streamFinished = true;
+              break;
+            }
 
             buffered.push(result.value);
             bufferedSize += result.value.byteLength;
-
-            armTimeout();
           }
 
           const completeBody = Buffer.concat(
@@ -219,122 +275,179 @@ async function sendUpstream(req, res, body) {
             bufferedSize
           );
 
-          const responseText = completeBody.toString("utf8");
-
-          if (isBusyResponse(responseText)) {
+          if (isBusyResponse(completeBody.toString("utf8"))) {
             retryBusy = true;
           }
         }
 
-        if (retryBusy) {
-          clearActiveTimeout();
+      } catch (preflightError) {
+        clearActiveTimeout();
 
-          console.error(
-            `API key slot ${keyEntry.slot} returned a busy response. Switching key.`
-          );
-
-          try {
-            await reader.cancel();
-          } catch {}
-
+        if (res.destroyed) {
           res.off("close", onClientClose);
-          lastError = new Error("Upstream service is busy.");
-
-          advanceKey(keyIndex);
-          continue;
+          return;
         }
 
-        // Only now mark this key as successful.
-        activeKeyIndex = keyIndex;
-
-        console.log(
-          `API key slot ${keyEntry.slot} succeeded. Active key retained.`
+        lastError = new Error(
+          timedOut
+            ? "Upstream preflight timeout."
+            : `Upstream preflight error: ${preflightError.message}`
         );
 
-        res.writeHead(upstream.status, {
-          "Content-Type": contentType,
-          "Cache-Control": "no-cache",
-          "X-Accel-Buffering": "no"
-        });
+        console.error(
+          `API key slot ${keyEntry.slot} preflight failed:`,
+          lastError.message
+        );
 
-        // Send the inspected initial chunks unchanged.
-        for (const chunk of buffered) {
-          if (res.destroyed) break;
+        try {
+          await reader.cancel();
+        } catch {}
 
-          if (!res.write(chunk)) {
-            await new Promise(resolve => {
-              res.once("drain", resolve);
-              res.once("close", resolve);
-            });
-          }
+        res.off("close", onClientClose);
+        advanceKey(keyIndex);
+        continue;
+      }
+
+      clearActiveTimeout();
+
+      if (retryBusy) {
+        lastError = new Error("Upstream service returned a busy response.");
+
+        console.error(
+          `API key slot ${keyEntry.slot} returned a busy response. Switching key.`
+        );
+
+        try {
+          await reader.cancel();
+        } catch {}
+
+        res.off("close", onClientClose);
+        advanceKey(keyIndex);
+        continue;
+      }
+
+      if (res.destroyed) {
+        try {
+          await reader.cancel();
+        } catch {}
+
+        res.off("close", onClientClose);
+        return;
+      }
+
+      // Preflight passed. This key is now active.
+      activeKeyIndex = keyIndex;
+
+      console.log(
+        `API key slot ${keyEntry.slot} passed preflight. Active key retained.`
+      );
+
+      res.writeHead(upstream.status, {
+        "Content-Type": contentType,
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no"
+      });
+
+      // Forward buffered chunks without changing their contents.
+      for (const chunk of buffered) {
+        if (res.destroyed) break;
+
+        if (!res.write(chunk)) {
+          const drained = await waitForDrain(res);
+          if (!drained) break;
         }
+      }
 
-        // Continue streaming the remaining response.
+      // Continue normal streaming immediately.
+      if (!streamFinished && !res.destroyed) {
+        armTimeout();
+
         while (!res.destroyed) {
           const result = await reader.read();
 
-          if (result.done) break;
+          if (result.done) {
+            streamFinished = true;
+            break;
+          }
 
           armTimeout();
 
           if (!res.write(result.value)) {
-            await new Promise(resolve => {
-              res.once("drain", resolve);
-              res.once("close", resolve);
-            });
+            const drained = await waitForDrain(res);
+            if (!drained) break;
           }
         }
-
-        clearActiveTimeout();
-
-        if (!res.destroyed && !res.writableEnded) {
-          res.end();
-        }
-
-      } catch (streamError) {
-        clearActiveTimeout();
-
-        if (timedOut) {
-          console.error(
-            `Upstream stream inactive for ${UPSTREAM_TIMEOUT / 1000}s.`
-          );
-        } else {
-          console.error(
-            "Upstream stream error:",
-            streamError.message
-          );
-        }
-
-        if (!res.destroyed) {
-          res.destroy(streamError);
-        }
-
-      } finally {
-        clearActiveTimeout();
-
-        try {
-          reader.releaseLock();
-        } catch {}
-
-        res.off("close", onClientClose);
       }
 
-      // Do not retry after response bytes have been sent.
+      clearActiveTimeout();
+
+      if (!res.destroyed && !res.writableEnded) {
+        res.end();
+      }
+
+      if (streamFinished) {
+        console.log(
+          `API key slot ${keyEntry.slot} response completed successfully.`
+        );
+      } else if (!res.destroyed) {
+        console.error(
+          `API key slot ${keyEntry.slot} stream ended unexpectedly.`
+        );
+        res.destroy();
+      }
+
       return;
 
     } catch (error) {
       clearActiveTimeout();
-      res.off("close", onClientClose);
 
-      if (res.destroyed) return;
+      if (res.destroyed) {
+        res.off("close", onClientClose);
+        return;
+      }
 
-      lastError = error;
+      // If headers were already sent, a transparent retry could
+      // duplicate or corrupt the answer. Do not retry at this point.
+      if (res.headersSent) {
+        console.error(
+          `API key slot ${keyEntry.slot} stream failed after response started:`,
+          timedOut ? "timeout" : error.message
+        );
 
-      console.error(
-        `API key slot ${keyEntry.slot} failed: ${error.message}`
+        if (!res.destroyed) res.destroy(error);
+
+        res.off("close", onClientClose);
+        return;
+      }
+
+      lastError = new Error(
+        timedOut
+          ? "Upstream request timeout."
+          : error.message
       );
 
+      console.error(
+        `API key slot ${keyEntry.slot} failed: ${lastError.message}`
+      );
+
+      if (reader) {
+        try {
+          await reader.cancel();
+        } catch {}
+      }
+
+      res.off("close", onClientClose);
       advanceKey(keyIndex);
+    } finally {
+      clearActiveTimeout();
+
+      if (reader) {
+        try {
+          reader.releaseLock();
+        } catch {}
+      }
+
+      res.off("close", onClientClose);
     }
   }
 
