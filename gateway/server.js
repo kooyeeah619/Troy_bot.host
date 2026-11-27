@@ -11,7 +11,6 @@ const API_KEYS = [
 
 const GATEWAY_APP_KEY = process.env.GATEWAY_APP_KEY;
 
-const RETRY_WAIT = 60000;
 const UPSTREAM_TIMEOUT = 120000;
 const MAX_REQUEST_SIZE = 2 * 1024 * 1024;
 const MAX_RESPONSE_SIZE = 64 * 1024 * 1024;
@@ -26,27 +25,6 @@ function json(res, status, data) {
   });
 
   res.end(JSON.stringify(data));
-}
-
-function waitForRetry(res, isGone) {
-  return new Promise(resolve => {
-    if (isGone()) return resolve(false);
-
-    let finished = false;
-
-    const finish = result => {
-      if (finished) return;
-      finished = true;
-      clearTimeout(timer);
-      res.off("close", onClose);
-      resolve(result);
-    };
-
-    const onClose = () => finish(false);
-    const timer = setTimeout(() => finish(true), RETRY_WAIT);
-
-    res.once("close", onClose);
-  });
 }
 
 async function readRequest(req) {
@@ -225,10 +203,7 @@ const server = http.createServer(async (req, res) => {
   res.on("close", () => {
     if (!res.writableEnded) {
       clientGone = true;
-
-      if (activeController) {
-        activeController.abort();
-      }
+      activeController?.abort();
     }
   });
 
@@ -256,8 +231,6 @@ const server = http.createServer(async (req, res) => {
   }
 
   while (!clientGone) {
-    let cycleFailed = false;
-
     for (let i = 0; i < API_KEYS.length; i++) {
       if (clientGone) return;
 
@@ -331,26 +304,17 @@ const server = http.createServer(async (req, res) => {
         console.warn(
           `API key slot ${i + 1} failed: ${reason}`
         );
-
-        cycleFailed = true;
       }
     }
 
-    if (cycleFailed && !clientGone) {
-      console.warn(
-        "All API keys failed. Retrying from Key 1 in 60 seconds."
-      );
+    if (clientGone) return;
 
-      const shouldRetry = await waitForRetry(
-        res,
-        () => clientGone
-      );
-
-      if (!shouldRetry) return;
-    }
+    console.warn(
+      "All API keys failed. Immediately restarting from Key 1."
+    );
   }
 });
 
 server.listen(PORT, () => {
-  console.log(`Universal API Gateway running on port ${PORT}`);
+  console.log("Universal API Gateway running on port " + PORT);
 });
