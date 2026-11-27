@@ -1,3 +1,65 @@
+const http = require("http");
+
+const PORT = process.env.PORT || 3000;
+const UPSTREAM = "https://100milionseek.top/v1/chat/completions";
+const GATEWAY_APP_KEY = process.env.GATEWAY_APP_KEY;
+
+const API_KEYS = [
+  { slot: 1, key: process.env.API_KEY_1 },
+  { slot: 2, key: process.env.API_KEY_2 },
+  { slot: 3, key: process.env.API_KEY_3 }
+].filter(item => item.key && item.key.trim());
+
+const UPSTREAM_TIMEOUT = 120000;
+const MAX_REQUEST_SIZE = 2 * 1024 * 1024;
+
+let activeKeyIndex = 0;
+
+function sendJson(res, status, data) {
+  if (res.headersSent || res.destroyed) return;
+
+  res.writeHead(status, {
+    "Content-Type": "application/json",
+    "Cache-Control": "no-cache"
+  });
+
+  res.end(JSON.stringify(data));
+}
+
+function isBusyResponse(value) {
+  return /service\s+is\s+busy\s+right\s+now|passes\s+from\s+\$?1\s+raise\s+your\s+limits|temporarily\s+unavailable|upstream\s+busy/i.test(value);
+}
+
+function advanceKey(index) {
+  if (!API_KEYS.length) return;
+
+  if (activeKeyIndex === index) {
+    activeKeyIndex = (index + 1) % API_KEYS.length;
+  }
+}
+
+function readRequest(req) {
+  return new Promise((resolve, reject) => {
+    let chunks = [];
+    let size = 0;
+
+    req.on("data", chunk => {
+      size += chunk.length;
+
+      if (size > MAX_REQUEST_SIZE) {
+        reject(new Error("Request too large"));
+        req.destroy();
+        return;
+      }
+
+      chunks.push(chunk);
+    });
+
+    req.on("end", () => resolve(Buffer.concat(chunks)));
+    req.on("error", reject);
+  });
+}
+
 async function sendUpstream(req, res, body) {
   if (!API_KEYS.length) {
     return sendJson(res, 500, { error: { message: "No upstream API keys configured" } });
@@ -39,22 +101,17 @@ async function sendUpstream(req, res, body) {
 
       const contentType = upstream.headers.get("content-type") || "application/json";
       const reader = upstream.body.getReader();
-
-      // --- LOGIC PARA SA STREAMING FALLBACK ---
-      // 1. Kunin muna ang unang chunk. Kung mag-fail dito, pwede pa tayong mag-fallback.
       const firstChunk = await reader.read();
       
       if (firstChunk.done) {
         throw new Error("Stream ended immediately");
       }
 
-      // Check kung busy response bago mag-send ng headers
       const firstChunkStr = Buffer.from(firstChunk.value).toString("utf8");
       if (isBusyResponse(firstChunkStr)) {
         throw new Error("Upstream busy during initial stream");
       }
 
-      // 2. Kung nakalampas sa check, ibig sabihin valid na yung stream. I-setup na natin ang client.
       activeKeyIndex = index;
       console.log(`API key slot ${item.slot} succeeded. Active key retained.`);
 
@@ -65,10 +122,8 @@ async function sendUpstream(req, res, body) {
         "Connection": "keep-alive"
       });
 
-      // Isulat ang unang chunk na nakuha natin
       res.write(Buffer.from(firstChunk.value));
 
-      // 3. Ituloy ang natitirang stream
       try {
         while (true) {
           const { done, value } = await reader.read();
@@ -82,8 +137,6 @@ async function sendUpstream(req, res, body) {
 
           const chunk = Buffer.from(value);
 
-          // Dito, kapag nag-fail sa gitna, hindi na tayo makakapag-fallback nang maayos
-          // dahil naipadala na natin ang headers sa client. Kaya i-destroy na lang.
           if (isBusyResponse(chunk.toString("utf8"))) {
             throw new Error("Upstream busy during streaming");
           }
@@ -110,25 +163,21 @@ async function sendUpstream(req, res, body) {
         }
 
         console.log(`API key slot ${item.slot} stream completed.`);
-        return; // Tapos na ang stream
+        return;
 
       } catch (streamError) {
-        // Dito nahuhuli ang "operation aborted" sa gitna ng stream
         console.error(`API key slot ${item.slot} failed mid-stream: ${streamError.message}`);
         advanceKey(index);
         if (!res.destroyed && !res.writableEnded) {
-            res.destroy(streamError); // Force close connection sa client
+            res.destroy(streamError);
         }
-        return; // Cannot fallback anymore
+        return;
       }
 
     } catch (error) {
-      // Dito nahuhuli yung mga error BAGO mag-umpisa ang stream (e.g., 429, or failed first chunk)
       lastError = error;
       console.error(`API key slot ${item.slot} failed: ${error.message}`);
       advanceKey(index);
-      
-      // Ituloy ang loop para subukan ang susunod na key
       
     } finally {
       clearTimeout(timeout);
@@ -141,4 +190,61 @@ async function sendUpstream(req, res, body) {
       details: lastError ? lastError.message : "Unknown error"
     }
   });
-      }
+}
+
+const server = http.createServer(async (req, res) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    "Content-Type, Authorization"
+  );
+  res.setHeader(
+    "Access-Control-Allow-Methods",
+    "POST, GET, OPTIONS"
+  );
+
+  if (req.method === "OPTIONS") {
+    res.writeHead(204);
+    return res.end();
+  }
+
+  if (req.method === "GET" && req.url === "/health") {
+    return sendJson(res, 200, {
+      status: "ok",
+      configuredKeys: API_KEYS.length,
+      activeSlot: API_KEYS.length ? API_KEYS[activeKeyIndex].slot : null
+    });
+  }
+
+  if (req.method !== "POST" || req.url !== "/v1/chat/completions") {
+    return sendJson(res, 404, { error: { message: "Not found" } });
+  }
+
+  if (!GATEWAY_APP_KEY) {
+    return sendJson(res, 500, { error: { message: "Gateway app key not configured" } });
+  }
+
+  const auth = req.headers.authorization || "";
+  const suppliedKey = auth.replace(/^Bearer\s+/i, "");
+
+  if (suppliedKey !== GATEWAY_APP_KEY) {
+    return sendJson(res, 401, { error: { message: "Unauthorized" } });
+  }
+
+  let body;
+
+  try {
+    body = await readRequest(req);
+    JSON.parse(body.toString("utf8"));
+  } catch (error) {
+    return sendJson(res, 400, { error: { message: error.message || "Invalid JSON" } });
+  }
+
+  await sendUpstream(req, res, body);
+});
+
+server.listen(PORT, "0.0.0.0", () => {
+  console.log(`Troy Gateway running on port ${PORT}`);
+  console.log(`Configured API keys: ${API_KEYS.length}`);
+  console.log(`Initial active key: ${API_KEYS.length ? API_KEYS[activeKeyIndex].slot : "NONE"}`);
+});
