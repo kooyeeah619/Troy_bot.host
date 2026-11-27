@@ -12,7 +12,7 @@ const API_KEYS = [
 ].filter(item => item.key && item.key.trim());
 
 const UPSTREAM_TIMEOUT = 120000;
-const MAX_REQUEST_SIZE = 2 * 1024 * 1024;
+const MAX_REQUEST_SIZE = 20 * 1024 * 1024;
 const SSE_PREFLIGHT_CHUNKS = 8;
 const SSE_PREFLIGHT_MAX_BYTES = 16384;
 
