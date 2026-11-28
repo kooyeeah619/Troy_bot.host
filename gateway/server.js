@@ -1,496 +1,435 @@
 const http = require("http");
 
 const PORT = process.env.PORT || 3000;
-
-const DEEPSEEK_UPSTREAM =
-  "https://100milionseek.top/v1/chat/completions";
-
-const GROK_BASE_URL = (
-  process.env.GROK_BASE_URL || "https://100miliongrok.top/v1"
-).replace(/\/+$/, "");
-
-const GROK_UPSTREAM = `${GROK_BASE_URL}/chat/completions`;
-
+const UPSTREAM = "https://100milionseek.top/v1/chat/completions";
 const GATEWAY_APP_KEY = process.env.GATEWAY_APP_KEY;
-const GROK_API_KEY = process.env.GROK_API_KEY;
 
 const API_KEYS = [
-  { slot: 1, key: process.env.API_KEY_1 },
-  { slot: 2, key: process.env.API_KEY_2 },
-  { slot: 3, key: process.env.API_KEY_3 }
+{ slot: 1, key: process.env.API_KEY_1 },
+{ slot: 2, key: process.env.API_KEY_2 },
+{ slot: 3, key: process.env.API_KEY_3 }
 ].filter(item => item.key && item.key.trim());
 
-const UPSTREAM_TIMEOUT = 180000;
+const UPSTREAM_TIMEOUT = 180000; // 3 minutes
 const MAX_REQUEST_SIZE = 20 * 1024 * 1024;
-
-const SSE_PREFLIGHT_CHUNKS = 4;
+const SSE_PREFLIGHT_CHUNKS = 4; // Nadagdagan para masalo yung buong error message
 const SSE_PREFLIGHT_MAX_BYTES = 16384;
 
 let activeKeyIndex = 0;
-
-function sendJson(res, status, data) {
-  if (res.headersSent) {
-    return res.end();
-  }
-
-  res.writeHead(status, {
-    "Content-Type": "application/json; charset=utf-8"
-  });
-
-  res.end(JSON.stringify(data));
-}
-
-function safeErrorText(value, key) {
-  let text = String(value || "");
-
-  if (key) {
-    text = text.split(key).join("[REDACTED]");
-  }
-
-  return text.slice(0, 2000);
-}
+let keyStateVersion = 0;
 
 function setActiveKey(index, reason) {
-  if (!API_KEYS.length || index < 0 || index >= API_KEYS.length) {
-    return;
-  }
+if (!API_KEYS.length || index < 0 || index >= API_KEYS.length) return;
 
-  if (activeKeyIndex !== index) {
-    const previous = API_KEYS[activeKeyIndex]?.slot;
-    const next = API_KEYS[index].slot;
+if (activeKeyIndex !== index) {
+const previous = activeKeyIndex;
+activeKeyIndex = index;
+keyStateVersion++;
 
-    activeKeyIndex = index;
+console.log(  
+  `Active API key changed: slot ${API_KEYS[previous].slot} -> slot ${API_KEYS[index].slot} (${reason})`  
+);
 
-    console.log(
-      `Active API key changed: slot ${previous} -> slot ${next} (${reason})`
-    );
-  }
+}
 }
 
 function advanceKey(keyIndex) {
-  if (API_KEYS.length <= 1) return;
+if (!API_KEYS.length) return;
 
-  if (activeKeyIndex === keyIndex) {
-    setActiveKey(
-      (keyIndex + 1) % API_KEYS.length,
-      "upstream failure"
-    );
-  }
+if (activeKeyIndex !== keyIndex) {
+console.log(
+Ignoring stale failure from slot ${API_KEYS[keyIndex].slot}; active key has changed.
+);
+return;
 }
 
-function getNextUntriedKey(attemptedKeys, keys, currentIndex) {
-  if (!keys.length) return -1;
+const nextIndex = (keyIndex + 1) % API_KEYS.length;
+setActiveKey(nextIndex, "upstream failure");
+}
 
-  for (let offset = 0; offset < keys.length; offset++) {
-    const index = (currentIndex + offset) % keys.length;
+function sendJson(res, status, data) {
+if (res.headersSent || res.destroyed) return;
 
-    if (!attemptedKeys.has(index)) {
-      return index;
-    }
-  }
+res.writeHead(status, {
+"Content-Type": "application/json",
+"Cache-Control": "no-cache"
+});
 
-  return -1;
+res.end(JSON.stringify(data));
 }
 
 function isBusyResponse(value) {
-  return /service\s+is\s+busy|passes\s+from|raise\s+your\s+limits|temporarily\s+unavailable|upstream\s+busy|too\s+many\s+requests|rate\s+limit/i.test(
-    value
-  );
+// Pinalawak na regex para masalo lahat ng variation ng "busy" o limit errors
+return /service\s+is\s+busy|passes\s+from|raise\s+your\s+limits|temporarily\s+unavailable|upstream\s+busy|too\s+many\s+requests|rate\s+limit/i.test(value);
 }
 
-async function readRequest(req) {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    let size = 0;
-    let exceeded = false;
+class RequestTooLargeError extends Error {
+constructor() {
+super("Request body exceeds the 20 MB limit.");
+this.name = "RequestTooLargeError";
+this.statusCode = 413;
+}
+}
 
-    req.on("data", chunk => {
-      size += chunk.length;
+function readRequest(req) {
+return new Promise((resolve, reject) => {
+let size = 0;
+let finished = false;
+const chunks = [];
 
-      if (size > MAX_REQUEST_SIZE) {
-        exceeded = true;
-        return;
-      }
+function rejectRequest(error) {  
+  if (finished) return;  
+  finished = true;  
+  chunks.length = 0;  
+  req.resume(); // Drain remaining upload  
+  reject(error);  
+}  
 
-      chunks.push(chunk);
-    });
+const contentLength = Number(req.headers["content-length"]);  
 
-    req.on("end", () => {
-      if (exceeded) {
-        return reject(
-          Object.assign(
-            new Error("Request body exceeds 20 MB limit."),
-            { statusCode: 413 }
-          )
-        );
-      }
+if (Number.isFinite(contentLength) && contentLength > MAX_REQUEST_SIZE) {  
+  rejectRequest(new RequestTooLargeError());  
+  return;  
+}  
 
-      resolve(Buffer.concat(chunks));
-    });
+req.on("data", chunk => {  
+  if (finished) return;  
+  size += chunk.length;  
 
-    req.on("error", reject);
-  });
+  if (size > MAX_REQUEST_SIZE) {  
+    rejectRequest(new RequestTooLargeError());  
+    return;  
+  }  
+  chunks.push(chunk);  
+});  
+
+req.on("end", () => {  
+  if (finished) return;  
+  finished = true;  
+  resolve(Buffer.concat(chunks));  
+});  
+
+req.on("aborted", () => {  
+  if (finished) return;  
+  finished = true;  
+  reject(new Error("Client aborted the request."));  
+});  
+
+req.on("error", error => {  
+  if (finished) return;  
+  finished = true;  
+  reject(error);  
+});
+
+});
 }
 
 function waitForDrain(res) {
-  return new Promise(resolve => {
-    if (res.destroyed || res.writableEnded) {
-      return resolve();
-    }
+return new Promise(resolve => {
+if (res.destroyed || res.writableEnded) return resolve(false);
 
-    res.once("drain", resolve);
-    res.once("close", resolve);
-  });
+const cleanup = () => {  
+  res.off("drain", onDrain);  
+  res.off("close", onClose);  
+  res.off("error", onError);  
+};  
+
+const onDrain = () => { cleanup(); resolve(true); };  
+const onClose = () => { cleanup(); resolve(false); };  
+const onError = () => { cleanup(); resolve(false); };  
+
+res.once("drain", onDrain);  
+res.once("close", onClose);  
+res.once("error", onError);
+
+});
+}
+
+function getNextUntriedKey(attemptedKeys) {
+if (!API_KEYS.length) return -1;
+
+for (let offset = 0; offset < API_KEYS.length; offset++) {
+const index = (activeKeyIndex + offset) % API_KEYS.length;
+if (!attemptedKeys.has(index)) {
+return index;
+}
+}
+return -1;
 }
 
 async function sendUpstream(req, res, body) {
-  let requestModel = "";
-
-  try {
-    requestModel = JSON.parse(body.toString("utf8")).model || "";
-  } catch {
-    return sendJson(res, 400, {
-      error: { message: "Invalid model request." }
-    });
-  }
-
-  const useGrok = requestModel === "grok-4.7";
-
-  const requestKeys = useGrok
-    ? (GROK_API_KEY
-        ? [{ slot: "GROK", key: GROK_API_KEY }]
-        : [])
-    : API_KEYS;
-
-  const requestUpstream = useGrok
-    ? GROK_UPSTREAM
-    : DEEPSEEK_UPSTREAM;
-
-  if (!requestKeys.length) {
-    return sendJson(res, 500, {
-      error: {
-        message: useGrok
-          ? "GROK_API_KEY is not configured."
-          : "No DeepSeek API keys configured."
-      }
-    });
-  }
-
-  const attemptedKeys = new Set();
-  let lastError = null;
-
-  for (let attempt = 0; attempt < requestKeys.length; attempt++) {
-    lastError = null;
-
-    const startIndex = useGrok ? 0 : activeKeyIndex;
-
-    const keyIndex = getNextUntriedKey(
-      attemptedKeys,
-      requestKeys,
-      startIndex
-    );
-
-    if (keyIndex < 0) break;
-
-    attemptedKeys.add(keyIndex);
-
-    const selectedKey = requestKeys[keyIndex];
-
-    console.log(
-      `Using ${useGrok ? "Grok" : "DeepSeek"} API key slot ${selectedKey.slot}`
-    );
-
-    const controller = new AbortController();
-    let idleTimer;
-
-    function resetIdleTimer() {
-      clearTimeout(idleTimer);
-
-      idleTimer = setTimeout(() => {
-        controller.abort(
-          new Error("Upstream idle timeout after 3 minutes.")
-        );
-      }, UPSTREAM_TIMEOUT);
-    }
-
-    resetIdleTimer();
-
-    let upstreamResponse;
-    let reader;
-
-    try {
-      upstreamResponse = await fetch(requestUpstream, {
-        method: "POST",
-        headers: {
-          "Authorization": `Bearer ${selectedKey.key}`,
-          "Content-Type": "application/json",
-          "Accept": "text/event-stream, application/json"
-        },
-        body,
-        signal: controller.signal
-      });
-
-      if (!upstreamResponse.ok) {
-        const errorText = await upstreamResponse.text();
-        clearTimeout(idleTimer);
-
-        const safeText = safeErrorText(
-          errorText,
-          selectedKey.key
-        );
-
-        lastError = new Error(
-          `HTTP ${upstreamResponse.status}: ${safeText}`
-        );
-
-        console.log(
-          `${useGrok ? "Grok" : "DeepSeek"} key slot ${selectedKey.slot} failed: HTTP ${upstreamResponse.status}`
-        );
-
-        console.log(
-          `Provider error response: ${safeText || "(empty response)"}`
-        );
-
-        if (!useGrok) advanceKey(keyIndex);
-
-        continue;
-      }
-
-      if (!upstreamResponse.body) {
-        clearTimeout(idleTimer);
-
-        lastError = new Error("Upstream returned an empty response.");
-
-        if (!useGrok) advanceKey(keyIndex);
-
-        continue;
-      }
-
-      reader = upstreamResponse.body.getReader();
-
-      const preflightChunks = [];
-      let preflightBytes = 0;
-      let preflightCount = 0;
-      let preflightEnded = false;
-      let busyResponse = false;
-
-      while (
-        preflightCount < SSE_PREFLIGHT_CHUNKS &&
-        preflightBytes < SSE_PREFLIGHT_MAX_BYTES
-      ) {
-        const result = await reader.read();
-
-        resetIdleTimer();
-
-        if (result.done) {
-          preflightEnded = true;
-          break;
-        }
-
-        preflightChunks.push(result.value);
-        preflightBytes += result.value.length;
-        preflightCount++;
-
-        const preview = Buffer.concat(
-          preflightChunks.map(chunk => Buffer.from(chunk))
-        ).toString("utf8");
-
-        if (isBusyResponse(preview)) {
-          busyResponse = true;
-
-          lastError = new Error(
-            "Upstream returned a busy response."
-          );
-
-          console.log(
-            `API key slot ${selectedKey.slot} returned a busy response.`
-          );
-
-          await reader.cancel().catch(() => {});
-          clearTimeout(idleTimer);
-
-          if (!useGrok) advanceKey(keyIndex);
-
-          break;
-        }
-      }
-
-      if (busyResponse) {
-        continue;
-      }
-
-      if (!useGrok) {
-        setActiveKey(keyIndex, "successful preflight");
-      }
-
-      console.log(
-        `API key slot ${selectedKey.slot} passed preflight. Active key retained.`
-      );
-
-      const headers = {
-        "Content-Type":
-          upstreamResponse.headers.get("content-type") ||
-          "application/json",
-        "Cache-Control": "no-cache",
-        "X-Accel-Buffering": "no"
-      };
-
-      const contentEncoding =
-        upstreamResponse.headers.get("content-encoding");
-
-      if (contentEncoding) {
-        headers["Content-Encoding"] = contentEncoding;
-      }
-
-      res.writeHead(upstreamResponse.status, headers);
-
-      for (const chunk of preflightChunks) {
-        if (res.destroyed) break;
-
-        if (!res.write(Buffer.from(chunk))) {
-          await waitForDrain(res);
-        }
-      }
-
-      while (!preflightEnded && !res.destroyed) {
-        const result = await reader.read();
-
-        resetIdleTimer();
-
-        if (result.done) break;
-
-        if (!res.write(Buffer.from(result.value))) {
-          await waitForDrain(res);
-        }
-      }
-
-      clearTimeout(idleTimer);
-
-      if (!res.destroyed && !res.writableEnded) {
-        res.end();
-      }
-
-      console.log(
-        `API key slot ${selectedKey.slot} response completed successfully.`
-      );
-
-      return;
-
-    } catch (error) {
-      clearTimeout(idleTimer);
-
-      if (reader) {
-        await reader.cancel().catch(() => {});
-      }
-
-      lastError = error;
-
-      console.log(
-        `${useGrok ? "Grok" : "DeepSeek"} key slot ${selectedKey.slot} error: ${error.message}`
-      );
-
-      if (!useGrok) {
-        advanceKey(keyIndex);
-      }
-
-      if (res.headersSent) {
-        if (!res.destroyed && !res.writableEnded) {
-          res.end();
-        }
-
-        if (!useGrok) {
-          console.log(
-            `Next request will use active API key slot ${API_KEYS[activeKeyIndex].slot}.`
-          );
-        }
-
-        return;
-      }
-    }
-  }
-
-  if (!res.headersSent) {
-    sendJson(res, 502, {
-      error: {
-        message: useGrok
-          ? "Grok request failed."
-          : "All DeepSeek API keys failed.",
-        details: lastError
-          ? lastError.message
-          : "No available API key succeeded."
-      }
-    });
-  }
+if (!API_KEYS.length) {
+return sendJson(res, 500, { error: { message: "No API keys configured." } });
+}
+
+let lastError = null;
+const attemptedKeys = new Set();
+
+for (let attempt = 0; attempt < API_KEYS.length; attempt++) {
+if (res.destroyed) return;
+
+const keyIndex = getNextUntriedKey(attemptedKeys);  
+if (keyIndex < 0) break;  
+
+attemptedKeys.add(keyIndex);  
+const keyEntry = API_KEYS[keyIndex];  
+
+console.log(`Using active API key slot ${keyEntry.slot}`);  
+
+const controller = new AbortController();  
+let timeout = null;  
+let timedOut = false;  
+
+function armTimeout() {  
+  clearTimeout(timeout);  
+  timedOut = false;  
+  timeout = setTimeout(() => {  
+    timedOut = true;  
+    console.log(`Timeout reached for slot ${keyEntry.slot}. Aborting.`);  
+    controller.abort();  
+  }, UPSTREAM_TIMEOUT);  
+}  
+
+function clearActiveTimeout() {  
+  clearTimeout(timeout);  
+  timeout = null;  
+}  
+
+const onClientClose = () => {  
+  if (!res.writableEnded) {  
+    console.log("Client disconnected. Aborting upstream request.");  
+    controller.abort();  
+  }  
+};  
+
+res.once("close", onClientClose);  
+
+let reader = null;  
+
+try {  
+  armTimeout();  
+
+  const upstream = await fetch(UPSTREAM, {  
+    method: "POST",  
+    headers: {  
+      "Authorization": `Bearer ${keyEntry.key}`,  
+      "Content-Type": "application/json",  
+      "Accept": "text/event-stream, application/json"  
+    },  
+    body,  
+    signal: controller.signal  
+  });  
+
+  if (res.destroyed) { clearActiveTimeout(); res.off("close", onClientClose); return; }  
+
+  if (!upstream.ok) {  
+    let errorText = "";  
+    try { errorText = await upstream.text(); } catch (error) { errorText = error.message; }  
+    clearActiveTimeout();  
+
+    lastError = new Error(`Upstream HTTP ${upstream.status}: ${errorText.slice(0, 1000)}`);  
+    console.error(`API key slot ${keyEntry.slot} failed: HTTP ${upstream.status}`);  
+    res.off("close", onClientClose);  
+    advanceKey(keyIndex);  
+    continue;  
+  }  
+
+  if (!upstream.body) {  
+    clearActiveTimeout();  
+    lastError = new Error("Upstream returned an empty response.");  
+    console.error(`API key slot ${keyEntry.slot} returned an empty response.`);  
+    res.off("close", onClientClose);  
+    advanceKey(keyIndex);  
+    continue;  
+  }  
+
+  const contentType = upstream.headers.get("content-type") || "application/json";  
+  reader = upstream.body.getReader();  
+
+  const buffered = [];  
+  let bufferedSize = 0;  
+  let retryBusy = false;  
+  let streamFinished = false;  
+
+  try {  
+    if (contentType.toLowerCase().includes("text/event-stream")) {  
+      let inspected = "";  
+      const decoder = new TextDecoder();  
+
+      for (let i = 0; i < SSE_PREFLIGHT_CHUNKS; i++) {  
+        const result = await reader.read();  
+        armTimeout();  
+
+        if (result.done) { streamFinished = true; break; }  
+        buffered.push(result.value);  
+        bufferedSize += result.value.byteLength;  
+        inspected += decoder.decode(result.value, { stream: true });  
+
+        if (isBusyResponse(inspected)) { retryBusy = true; break; }  
+        if (bufferedSize >= SSE_PREFLIGHT_MAX_BYTES) break;  
+      }  
+      inspected += decoder.decode();  
+      if (isBusyResponse(inspected)) retryBusy = true;  
+    } else {  
+      while (true) {  
+        const result = await reader.read();  
+        armTimeout();  
+        if (result.done) { streamFinished = true; break; }  
+        buffered.push(result.value);  
+        bufferedSize += result.value.byteLength;  
+      }  
+      const completeBody = Buffer.concat(buffered.map(chunk => Buffer.from(chunk)), bufferedSize);  
+      if (isBusyResponse(completeBody.toString("utf8"))) retryBusy = true;  
+    }  
+  } catch (preflightError) {  
+    clearActiveTimeout();  
+    if (res.destroyed) { res.off("close", onClientClose); return; }  
+
+    lastError = new Error(timedOut ? "Upstream preflight timeout." : `Upstream preflight error: ${preflightError.message}`);  
+    console.error(`API key slot ${keyEntry.slot} preflight failed:`, lastError.message);  
+
+    try { await reader.cancel(); } catch {}  
+    res.off("close", onClientClose);  
+    advanceKey(keyIndex);  
+    continue;  
+  }  
+
+  clearActiveTimeout();  
+
+  if (retryBusy) {  
+    lastError = new Error("Upstream service returned a busy response.");  
+    console.error(`API key slot ${keyEntry.slot} returned a busy response. Switching key.`);  
+    try { await reader.cancel(); } catch {}  
+    res.off("close", onClientClose);  
+    advanceKey(keyIndex);  
+    continue;  
+  }  
+
+  if (res.destroyed) { try { await reader.cancel(); } catch {} res.off("close", onClientClose); return; }  
+
+  setActiveKey(keyIndex, "successful preflight");  
+
+  console.log(`API key slot ${keyEntry.slot} passed preflight. Active key retained.`);  
+
+  res.writeHead(upstream.status, {  
+    "Content-Type": contentType,  
+    "Cache-Control": "no-cache",  
+    "X-Accel-Buffering": "no"  
+  });  
+
+  for (const chunk of buffered) {  
+    if (res.destroyed) break;  
+    if (!res.write(chunk)) {  
+      const drained = await waitForDrain(res);  
+      if (!drained) break;  
+    }  
+  }  
+
+  if (!streamFinished && !res.destroyed) {  
+    armTimeout();  
+    while (!res.destroyed) {  
+      const result = await reader.read();  
+      armTimeout();  
+      if (result.done) { streamFinished = true; break; }  
+      if (!res.write(result.value)) {  
+        const drained = await waitForDrain(res);  
+        if (!drained) break;  
+      }  
+    }  
+  }  
+
+  clearActiveTimeout();  
+
+  if (!res.destroyed && !res.writableEnded) { res.end(); }  
+
+  if (streamFinished) {  
+    console.log(`API key slot ${keyEntry.slot} response completed successfully.`);  
+  } else if (!res.destroyed) {  
+    console.error(`API key slot ${keyEntry.slot} stream ended unexpectedly.`);  
+    res.destroy();  
+  }  
+  return;  
+
+} catch (error) {  
+  clearActiveTimeout();  
+  if (res.destroyed) { res.off("close", onClientClose); return; }  
+
+  if (res.headersSent) {  
+    console.error(`API key slot ${keyEntry.slot} stream failed after response started:`, timedOut ? "timeout" : error.message);  
+    advanceKey(keyIndex);  
+    console.log(`Next request will use active API key slot ${API_KEYS[activeKeyIndex].slot}.`);  
+    if (!res.destroyed) { res.destroy(error); }  
+    res.off("close", onClientClose);  
+    return;  
+  }  
+
+  lastError = new Error(timedOut ? "Upstream request timeout." : error.message);  
+  console.error(`API key slot ${keyEntry.slot} failed: ${lastError.message}`);  
+
+  if (reader) { try { await reader.cancel(); } catch {} }  
+  res.off("close", onClientClose);  
+  advanceKey(keyIndex);  
+
+} finally {  
+  clearActiveTimeout();  
+  if (reader) { try { reader.releaseLock(); } catch {} }  
+  res.off("close", onClientClose);  
+}
+
+}
+
+console.error("All configured API keys failed.");
+
+sendJson(res, 502, {
+error: { message: "All API keys failed.", details: lastError ? lastError.message : "Unknown upstream error." }
+});
 }
 
 const server = http.createServer(async (req, res) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
+res.setHeader("Access-Control-Allow-Origin", "*");
+res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type");
+res.setHeader("Access-Control-Allow-Methods", "POST, GET, OPTIONS");
 
-  res.setHeader(
-    "Access-Control-Allow-Headers",
-    "Authorization, Content-Type"
-  );
+if (req.method === "OPTIONS") { res.writeHead(204); return res.end(); }
 
-  res.setHeader(
-    "Access-Control-Allow-Methods",
-    "POST, GET, OPTIONS"
-  );
+if (req.method === "GET" && req.url === "/health") {
+res.writeHead(200, { "Content-Type": "text/plain" });
+return res.end("ok");
+}
 
-  if (req.method === "OPTIONS") {
-    res.writeHead(204);
-    return res.end();
-  }
+if (req.method !== "POST" || req.url.split("?")[0] !== "/v1/chat/completions") {
+return sendJson(res, 404, { error: { message: "Not found." } });
+}
 
-  if (req.method === "GET" && req.url === "/health") {
-    return sendJson(res, 200, {
-      status: "ok",
-      service: "Troy Gateway",
-      providers: {
-        deepseek: API_KEYS.length > 0,
-        grok: Boolean(GROK_API_KEY)
-      },
-      deepseekKeysConfigured: API_KEYS.length,
-      activeDeepSeekKey: API_KEYS[activeKeyIndex]?.slot || null
-    });
-  }
+if (!GATEWAY_APP_KEY) {
+return sendJson(res, 500, { error: { message: "Gateway authentication is not configured." } });
+}
 
-  if (
-    req.method !== "POST" ||
-    req.url !== "/v1/chat/completions"
-  ) {
-    return sendJson(res, 404, {
-      error: { message: "Not found." }
-    });
-  }
+const authorization = req.headers.authorization || "";
+const suppliedKey = authorization.replace(/^Bearer\s+/i, "");
 
-  const authorization = req.headers.authorization || "";
-  const suppliedKey = authorization.replace(/^Bearer\s+/i, "");
+if (suppliedKey !== GATEWAY_APP_KEY) {
+return sendJson(res, 401, { error: { message: "Invalid Gateway Key." } });
+}
 
-  if (
-    !GATEWAY_APP_KEY ||
-    suppliedKey !== GATEWAY_APP_KEY
-  ) {
-    return sendJson(res, 401, {
-      error: { message: "Invalid gateway API key." }
-    });
-  }
-
-  try {
-    const body = await readRequest(req);
-    await sendUpstream(req, res, body);
-  } catch (error) {
-    sendJson(res, error.statusCode || 500, {
-      error: { message: error.message }
-    });
-  }
+try {
+const body = await readRequest(req);
+if (!body.length) return sendJson(res, 400, { error: { message: "Request body is empty." } });
+try { JSON.parse(body.toString("utf8")); } catch { return sendJson(res, 400, { error: { message: "Invalid JSON request body." } }); }
+await sendUpstream(req, res, body);
+} catch (error) {
+console.error("Gateway request error:", error.message);
+if (!res.headersSent) {
+const status = error.statusCode === 413 ? 413 : 500;
+sendJson(res, status, { error: { message: error.message } });
+} else if (!res.destroyed) {
+res.destroy(error);
+}
+}
 });
 
-server.listen(PORT, "0.0.0.0", () => {
-  console.log(`Troy Gateway running on port ${PORT}`);
-  console.log(`DeepSeek API keys configured: ${API_KEYS.length}`);
-  console.log(
-    `Initial active DeepSeek key: ${API_KEYS[activeKeyIndex]?.slot || "none"}`
-  );
-  console.log(`Grok API configured: ${Boolean(GROK_API_KEY)}`);
-  console.log(`Grok endpoint: ${GROK_UPSTREAM}`);
+server.listen(PORT, () => {
+console.log(Troy Gateway running on port ${PORT});
+console.log(Configured API keys: ${API_KEYS.length});
+console.log(Initial active key: ${API_KEYS.length ? API_KEYS[activeKeyIndex].slot : "NONE"});
 });
