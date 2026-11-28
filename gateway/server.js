@@ -27,7 +27,6 @@ const SSE_PREFLIGHT_CHUNKS = 4;
 const SSE_PREFLIGHT_MAX_BYTES = 16384;
 
 let activeKeyIndex = 0;
-let keyStateVersion = 0;
 
 function sendJson(res, status, data) {
   if (res.headersSent) {
@@ -41,6 +40,16 @@ function sendJson(res, status, data) {
   res.end(JSON.stringify(data));
 }
 
+function safeErrorText(value, key) {
+  let text = String(value || "");
+
+  if (key) {
+    text = text.split(key).join("[REDACTED]");
+  }
+
+  return text.slice(0, 2000);
+}
+
 function setActiveKey(index, reason) {
   if (!API_KEYS.length || index < 0 || index >= API_KEYS.length) {
     return;
@@ -51,7 +60,6 @@ function setActiveKey(index, reason) {
     const next = API_KEYS[index].slot;
 
     activeKeyIndex = index;
-    keyStateVersion++;
 
     console.log(
       `Active API key changed: slot ${previous} -> slot ${next} (${reason})`
@@ -70,11 +78,7 @@ function advanceKey(keyIndex) {
   }
 }
 
-function getNextUntriedKey(
-  attemptedKeys,
-  keys,
-  currentIndex
-) {
+function getNextUntriedKey(attemptedKeys, keys, currentIndex) {
   if (!keys.length) return -1;
 
   for (let offset = 0; offset < keys.length; offset++) {
@@ -176,6 +180,8 @@ async function sendUpstream(req, res, body) {
   let lastError = null;
 
   for (let attempt = 0; attempt < requestKeys.length; attempt++) {
+    lastError = null;
+
     const startIndex = useGrok ? 0 : activeKeyIndex;
 
     const keyIndex = getNextUntriedKey(
@@ -228,12 +234,21 @@ async function sendUpstream(req, res, body) {
         const errorText = await upstreamResponse.text();
         clearTimeout(idleTimer);
 
+        const safeText = safeErrorText(
+          errorText,
+          selectedKey.key
+        );
+
         lastError = new Error(
-          `HTTP ${upstreamResponse.status}: ${errorText.slice(0, 1000)}`
+          `HTTP ${upstreamResponse.status}: ${safeText}`
         );
 
         console.log(
-          `API key slot ${selectedKey.slot} failed: HTTP ${upstreamResponse.status}`
+          `${useGrok ? "Grok" : "DeepSeek"} key slot ${selectedKey.slot} failed: HTTP ${upstreamResponse.status}`
+        );
+
+        console.log(
+          `Provider error response: ${safeText || "(empty response)"}`
         );
 
         if (!useGrok) advanceKey(keyIndex);
@@ -257,6 +272,7 @@ async function sendUpstream(req, res, body) {
       let preflightBytes = 0;
       let preflightCount = 0;
       let preflightEnded = false;
+      let busyResponse = false;
 
       while (
         preflightCount < SSE_PREFLIGHT_CHUNKS &&
@@ -280,10 +296,14 @@ async function sendUpstream(req, res, body) {
         ).toString("utf8");
 
         if (isBusyResponse(preview)) {
-          lastError = new Error("Upstream returned a busy response.");
+          busyResponse = true;
+
+          lastError = new Error(
+            "Upstream returned a busy response."
+          );
 
           console.log(
-            `API key slot ${selectedKey.slot} returned a busy response. Switching key.`
+            `API key slot ${selectedKey.slot} returned a busy response.`
           );
 
           await reader.cancel().catch(() => {});
@@ -295,7 +315,7 @@ async function sendUpstream(req, res, body) {
         }
       }
 
-      if (lastError?.message === "Upstream returned a busy response.") {
+      if (busyResponse) {
         continue;
       }
 
@@ -366,7 +386,7 @@ async function sendUpstream(req, res, body) {
       lastError = error;
 
       console.log(
-        `API key slot ${selectedKey.slot} error: ${error.message}`
+        `${useGrok ? "Grok" : "DeepSeek"} key slot ${selectedKey.slot} error: ${error.message}`
       );
 
       if (!useGrok) {
@@ -468,6 +488,9 @@ const server = http.createServer(async (req, res) => {
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`Troy Gateway running on port ${PORT}`);
   console.log(`DeepSeek API keys configured: ${API_KEYS.length}`);
-  console.log(`Initial active DeepSeek key: ${API_KEYS[activeKeyIndex]?.slot || "none"}`);
+  console.log(
+    `Initial active DeepSeek key: ${API_KEYS[activeKeyIndex]?.slot || "none"}`
+  );
   console.log(`Grok API configured: ${Boolean(GROK_API_KEY)}`);
+  console.log(`Grok endpoint: ${GROK_UPSTREAM}`);
 });
